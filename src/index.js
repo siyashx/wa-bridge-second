@@ -586,7 +586,10 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
           locationLng: newChat.locationLng
         });
 
-        try { publishStomp('/app/sendChatMessage', newChat); } catch (e) { }
+        try {
+          await incrementTodayChatCount();
+          publishStomp('/app/sendChatMessage', newChat);
+        } catch (e) { }
         try {
           const oneSignalIds = await fetchPushTargets(0);
           if (oneSignalIds.length) {
@@ -647,7 +650,10 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
         isCompleted: false,
       };
 
-      try { publishStomp('/app/sendChatMessage', newChat); } catch (e) { }
+      try {
+        await incrementTodayChatCount();
+        publishStomp('/app/sendChatMessage', newChat);
+      } catch (e) { }
 
       // ✅ OneSignal push (yalnız non-reply)
       try {
@@ -868,6 +874,48 @@ async function isDuplicateByLastChats(messageText, messageType = "text", phone =
     // endpoint yatıbsa dublikat bloklamayaq (fail-open)
     console.error("isDuplicateByLastChats error:", e?.response?.status, e?.response?.data || e?.message);
     return false;
+  }
+}
+
+/* ---------------- Daily Chat Counter ---------------- */
+
+function getBakuDateString(date = new Date()) {
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Baku',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date); // "2026-04-26"
+}
+
+async function incrementTodayChatCount() {
+  try {
+    const today = getBakuDateString();
+
+    const getRes = await axios.get(`${TARGET_API_BASE}/api/v5/superAdmin/1`, {
+      timeout: 10000,
+    });
+
+    const superAdmin = getRes?.data || {};
+    const storedDate = superAdmin?.lastChatCountDate || null; // "2026-04-26" və ya null
+    const currentCount = Number(superAdmin?.todayChatCount) || 0;
+
+    const isNewDay = storedDate !== today;
+    const newCount = isNewDay ? 1 : currentCount + 1;
+
+    await axios.put(
+        `${TARGET_API_BASE}/api/v5/superAdmin/1`,
+        {
+          ...superAdmin,
+          todayChatCount: newCount,
+          lastChatCountDate: today,
+        },
+        { timeout: 10000 }
+    );
+
+    console.log(`[COUNTER] todayChatCount=${newCount} (date=${today}, newDay=${isNewDay})`);
+  } catch (e) {
+    console.error('[COUNTER] error:', e?.response?.status, e?.response?.data || e?.message);
   }
 }
 
