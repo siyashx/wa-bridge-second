@@ -14,6 +14,7 @@ const {
   GROUP_A_JID,
   GROUP_B_JID,
   GROUP_C_JID,
+  GROUP_D_JID,
   TARGET_API_BASE = 'https://mototaksi.az:9898',
   WS_URL = 'wss://mototaksi.az:9898/ws',
   ONE_SIGNAL_APP_ID,
@@ -22,7 +23,8 @@ const {
 } = process.env;
 
 const ALLOWED_GROUPS = new Set(
-  [GROUP_A_JID, GROUP_B_JID, GROUP_C_JID]
+  [GROUP_A_JID, GROUP_B_JID, GROUP_C_JID, 
+  GROUP_D_JID]
     .map(s => String(s || '').trim())
     .filter(Boolean)
 );
