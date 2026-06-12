@@ -15,17 +15,26 @@ const {
   GROUP_B_JID,
   GROUP_C_JID,
   GROUP_D_JID,
+  GROUP_E_JID,
   TARGET_API_BASE = 'https://mototaksi.az:9898',
   WS_URL = 'wss://mototaksi.az:9898/ws',
   ONE_SIGNAL_APP_ID,
   ONE_SIGNAL_REST_API_KEY,
   ANDROID_CHANNEL_ID,
+  BLOCKED_PHONES = '',
 } = process.env;
 
 const ALLOWED_GROUPS = new Set(
   [GROUP_A_JID, GROUP_B_JID, GROUP_C_JID, 
-  GROUP_D_JID]
+  GROUP_D_JID, GROUP_E_JID]
     .map(s => String(s || '').trim())
+    .filter(Boolean)
+);
+
+// Bu nömrələrdən gələn chatlar tam skip olunur (location da, text da)
+const BLOCKED_PHONES_SET = new Set(
+  BLOCKED_PHONES.split(',')
+    .map(s => s.replace(/[^\d]/g, ''))
     .filter(Boolean)
 );
 
@@ -489,7 +498,13 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
       parsePhoneFromSNetJid(foundSnet) ||
       parsePhoneFromSNetJid(env.participant);
 
-    if (!phone) phone = parseDigitsFromLid(env.participant);
+  if (!phone) phone = parseDigitsFromLid(env.participant);
+
+    // ✅ Bloklanmış nömrə -> tam skip, newChat-a getmir
+    if (phone && BLOCKED_PHONES_SET.has(phone)) {
+      console.log('SKIP: blocked phone', { phone });
+      return;
+    }
 
     // əvvəl text-i çıxar (reply olsa belə conversation içində olur)
     const textBody = extractText(env.msg);
