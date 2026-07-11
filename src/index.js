@@ -41,6 +41,20 @@ const INSTANCE_GROUPS = new Map(
     ].filter(([instanceName]) => instanceName)
 );
 
+const GROUP_DISPLAY_NAMES = (() => {
+    try {
+        const raw = process.env.EVOLUTION_GROUP_NAMES || '{}';
+        return JSON.parse(raw);
+    } catch (error) {
+        console.error(
+            '[GROUP COUNTER] EVOLUTION_GROUP_NAMES düzgün JSON deyil:',
+            error.message
+        );
+
+        return {};
+    }
+})();
+
 function getWebhookInstance(req) {
     const bodyInstance =
         req.body?.instance ||
@@ -650,10 +664,13 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     locationLng: newChat.locationLng
                 });
 
-                try {
-                    await incrementTodayChatCount();
-                    publishStomp('/app/sendChatMessage', newChat);
-                } catch (e) { }
+                publishStomp('/app/sendChatMessage', newChat);
+
+                await incrementTodayGroupCount(
+                    instanceName,
+                    env.remoteJid
+                );
+
                 try {
                     const oneSignalIds = await fetchPushTargets(0);
                     if (oneSignalIds.length) {
@@ -714,10 +731,12 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 isCompleted: false,
             };
 
-            try {
-                await incrementTodayChatCount();
-                publishStomp('/app/sendChatMessage', newChat);
-            } catch (e) { }
+            publishStomp('/app/sendChatMessage', newChat);
+
+            await incrementTodayGroupCount(
+                instanceName,
+                env.remoteJid
+            );
 
             // ✅ OneSignal push (yalnız non-reply)
             try {
@@ -952,34 +971,43 @@ function getBakuDateString(date = new Date()) {
     }).format(date); // "2026-04-26"
 }
 
-async function incrementTodayChatCount() {
+async function incrementTodayGroupCount(
+    instanceName,
+    groupJid
+) {
+    if (!instanceName || !groupJid) {
+        console.error('[GROUP COUNTER] instanceName və ya groupJid yoxdur');
+        return;
+    }
+
+    const groupName =
+        GROUP_DISPLAY_NAMES[groupJid] ||
+        `Naməlum qrup (${groupJid})`;
+
     try {
-        const today = getBakuDateString();
-
-        const getRes = await axios.get(`${TARGET_API_BASE}/api/v5/superAdmin/1`, {
-            timeout: 10000,
-        });
-
-        const superAdmin = getRes?.data || {};
-        const storedDate = superAdmin?.lastChatCountDate || null; // "2026-04-26" və ya null
-        const currentCount = Number(superAdmin?.todayChatCount) || 0;
-
-        const isNewDay = storedDate !== today;
-        const newCount = isNewDay ? 1 : currentCount + 1;
-
-        await axios.put(
-            `${TARGET_API_BASE}/api/v5/superAdmin/1`,
+        await axios.post(
+            `${TARGET_API_BASE}/api/v5/whatsapp-group-stats/increment`,
             {
-                ...superAdmin,
-                todayChatCount: newCount,
-                lastChatCountDate: today,
+                instanceName,
+                groupJid,
+                groupName,
             },
-            { timeout: 10000 }
+            {
+                timeout: 10000,
+            }
         );
 
-        console.log(`[COUNTER] todayChatCount=${newCount} (date=${today}, newDay=${isNewDay})`);
-    } catch (e) {
-        console.error('[COUNTER] error:', e?.response?.status, e?.response?.data || e?.message);
+        console.log('[GROUP COUNTER] artırıldı', {
+            instanceName,
+            groupJid,
+            groupName,
+        });
+    } catch (error) {
+        console.error(
+            '[GROUP COUNTER] artırılmadı:',
+            error?.response?.status,
+            error?.response?.data || error.message
+        );
     }
 }
 
