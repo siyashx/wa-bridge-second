@@ -261,11 +261,16 @@ function normalizeEnvelope(data) {
         !!env?.key?.fromMe ||
         false;
 
-    // ✅ BUNU ƏLAVƏ ET — Evolution-da reply info çox vaxt buradadır
+    // Evolution API-də reply contextInfo müxtəlif message tiplərinin içində ola bilər.
+    const coreMsg = unwrapMessage(msg) || {};
+
     const contextInfo =
         env.contextInfo ||
         root.contextInfo ||
         msg.contextInfo ||
+        coreMsg.contextInfo ||
+        coreMsg.extendedTextMessage?.contextInfo ||
+        coreMsg.locationMessage?.contextInfo ||
         root.message?.contextInfo ||
         null;
 
@@ -404,6 +409,76 @@ function getStaticLocation(msg) {
         url: lm.url || `https://maps.google.com/?q=${lat},${lng}`,
         _raw: lm,
     };
+}
+
+// Reply özü yalnız text və ya location ola bilər.
+function getIncomingReplyType(msg) {
+    const core = unwrapMessage(msg) || {};
+
+    if (core.locationMessage) return 'location';
+
+    if (
+        typeof core.conversation === 'string' ||
+        typeof core.extendedTextMessage?.text === 'string'
+    ) {
+        return 'text';
+    }
+
+    return 'unknown';
+}
+
+// Text reply yalnız bu şərtlərdən ən az birini ödəyərsə qəbul olunur:
+// - Aktiv / Aktivdir (böyük-kiçik hərf fərq etmir);
+// - mətn daxilində ayrıca 1 və ya 2 rəqəmli ədəd;
+// - mətn daxilində ayrıca 1, 2 və ya 3 sual işarəsi.
+function isAllowedTextReply(raw) {
+    const text = String(raw || '')
+        .normalize('NFKC')
+        .trim();
+
+    if (!text) return false;
+
+    const folded = text
+        .toLocaleLowerCase('az-AZ')
+        .replace(/ı/g, 'i');
+
+    const hasActive =
+        /(^|[^a-z0-9])aktiv(?:dir)?(?=$|[^a-z0-9])/i.test(folded);
+
+    // 1 və 2 rəqəm qəbul olunur; 123 kimi 3+ rəqəmin içindən hissə götürülmür.
+    const hasOneOrTwoDigitNumber =
+        /(^|\D)\d{1,2}(\D|$)/.test(text);
+
+    // 1–3 sual işarəsi qəbul olunur; 4+ sual işarəsi qəbul edilmir.
+    const hasOneToThreeQuestions =
+        /(^|[^?])\?{1,3}([^?]|$)/.test(text);
+
+    return (
+        hasActive ||
+        hasOneOrTwoDigitNumber ||
+        hasOneToThreeQuestions
+    );
+}
+
+// Əlavə DB sütunu yaratmadan cavab verilən konumu replyMessage-də saxlayır.
+function makeLocationReplyReference(location) {
+    const lat = Number(location?.lat);
+    const lng = Number(location?.lng);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return '';
+    }
+
+    return `__LOCATION__:${lat.toFixed(7)},${lng.toFixed(7)}`;
+}
+
+function getLocationTitle(location) {
+    return (
+        (location?.caption && String(location.caption).trim()) ||
+        (location?.name && String(location.name).trim()) ||
+        (location?.address && String(location.address).trim()) ||
+        'Yer paylaşımı'
+    );
 }
 
 /* ---------------- routes ---------------- */
@@ -570,6 +645,152 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
         const quotedLoc = getQuotedLocationFromEnv(env);
 
+        /*
+         * WHATSAPP REPLY İNTEQRASİYASI
+         *
+         * - Reply özü LOCATION-dırsa həmişə qəbul olunur.
+         * - Reply özü TEXT-dirsə yalnız isAllowedTextReply() qaydasına
+         *   uyğun olduqda qəbul olunur.
+         * - Cavab verilən mesaj LOCATION-dırsa, onun koordinatı
+         *   mövcud replyMessage sahəsində saxlanılır.
+         * - DB-yə yalnız mövcud Chat sahələri göndərilir.
+         */
+        if (isReply) {
+            const replyType = getIncomingReplyType(env.msg);
+
+            if (replyType === 'unknown') {
+                console.log('SKIP REPLY: yalnız text və location dəstəklənir');
+                return;
+            }
+
+            const cleanReplyText = String(textBody || '').trim();
+
+            if (
+                replyType === 'text' &&
+                !isAllowedTextReply(cleanReplyText)
+            ) {
+                console.log('SKIP TEXT REPLY: qaydaya uyğun deyil', {
+                    text: cleanReplyText,
+                });
+                return;
+            }
+
+            // Webhook eyni reply-ni təkrar göndərərsə DB-də dublikat yaranmasın.
+            if (seenRecently(`reply:${env.id}`)) {
+                console.log('SKIP REPLY: duplicate webhook', {
+                    id: env.id,
+                });
+                return;
+            }
+
+            const timestamp = formatBakuTimestamp();
+            const normalizedPhone = phone
+                ? `+${phone}`.replace('++', '+')
+                : '';
+
+            const replyReference = quotedLoc
+                ? makeLocationReplyReference(quotedLoc)
+                : String(
+                    quoted?.text || 'Cavab verilən mesaj'
+                ).trim();
+
+            if (!replyReference) {
+                console.log('SKIP REPLY: replyMessage boşdur');
+                return;
+            }
+
+            if (replyType === 'location') {
+                const replyLocation = selfLoc;
+
+                if (!replyLocation) {
+                    console.log('SKIP LOCATION REPLY: koordinat yoxdur');
+                    return;
+                }
+
+                const locationReplyChat = {
+                    id: Date.now(),
+                    groupId: "0",
+                    userId: 2,
+                    username: "Sifariş Qrupu İstifadəçisi",
+                    phone: normalizedPhone,
+                    isSeenIds: [],
+
+                    messageType: "location",
+                    imageUrl: null,
+                    audioUrl: null,
+                    userType: "customer",
+
+                    isReply: true,
+                    replyUserId: 2,
+                    replyMessage: replyReference,
+
+                    message: getLocationTitle(replyLocation),
+                    isWebsite: null,
+                    timestamp,
+                    isCompleted: false,
+
+                    locationLat: Number(replyLocation.lat),
+                    locationLng: Number(replyLocation.lng),
+                    thumbnail: "",
+                };
+
+                console.log('SEND LOCATION REPLY -> RN', {
+                    message: locationReplyChat.message,
+                    replyMessage: locationReplyChat.replyMessage,
+                    locationLat: locationReplyChat.locationLat,
+                    locationLng: locationReplyChat.locationLng,
+                });
+
+                publishStomp(
+                    '/app/sendChatMessage',
+                    locationReplyChat
+                );
+
+                // Reply yeni sifariş deyil: statistika və push yoxdur.
+                return;
+            }
+
+            const textReplyChat = {
+                id: Date.now(),
+                groupId: "0",
+                userId: 2,
+                username: "Sifariş Qrupu İstifadəçisi",
+                phone: normalizedPhone,
+                isSeenIds: [],
+
+                messageType: "text",
+                imageUrl: null,
+                audioUrl: null,
+                userType: "customer",
+
+                isReply: true,
+                replyUserId: 2,
+                replyMessage: replyReference,
+
+                message: cleanReplyText,
+                isWebsite: null,
+                timestamp,
+                isCompleted: false,
+
+                locationLat: null,
+                locationLng: null,
+                thumbnail: "",
+            };
+
+            console.log('SEND TEXT REPLY -> RN', {
+                message: textReplyChat.message,
+                replyMessage: textReplyChat.replyMessage,
+            });
+
+            publishStomp(
+                '/app/sendChatMessage',
+                textReplyChat
+            );
+
+            // Reply yeni sifariş deyil: statistika və push yoxdur.
+            return;
+        }
+
         dbgLoc('ENTER location handler', {
             isReply,
             msgTs: getMsgTsMs(env),
@@ -632,36 +853,30 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     username: "Sifariş Qrupu İstifadəçisi",
                     phone: phonePrefixed,
                     isSeenIds: [],
+
+                    messageType: "location",
+                    imageUrl: null,
+                    audioUrl: null,
                     userType: "customer",
 
-                    // ✅ type aliases (backend bəzən messageType yox, type saxlayır)
-                    messageType: "location",
-                    type: "location",
+                    isReply: false,
+                    replyUserId: null,
+                    replyMessage: null,
 
-                    // ✅ text
                     message: locationTitle,
-                    text: locationTitle,
+                    isWebsite: null,
+                    timestamp,
+                    isCompleted: false,
 
-                    // ✅ coords - bir neçə formatda
-                    locationLat: lat,
-                    locationLng: lng,
-                    latitude: lat,
-                    longitude: lng,
-                    lat,
-                    lng,
-                    location: { lat, lng },
-
-                    // ✅ thumbnail (RN səninki kimi data:image base64 gözləyir)
-                    thumbnail: b64Thumb,
-                    timestamp,           // "YYYY-MM-DD HH:mm:ss"
-                    createdAt: timestamp // ✅ bəzən app createdAt oxuyur
+                    locationLat: Number(effectiveLoc.lat),
+                    locationLng: Number(effectiveLoc.lng),
+                    thumbnail: "",
                 };
 
                 console.log("STOMP NEWCHAT (location) =", {
                     messageType: newChat.messageType,
-                    type: newChat.type,
                     locationLat: newChat.locationLat,
-                    locationLng: newChat.locationLng
+                    locationLng: newChat.locationLng,
                 });
 
                 publishStomp('/app/sendChatMessage', newChat);
@@ -723,12 +938,24 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 username: 'Sifariş Qrupu İstifadəçisi',
                 phone: normalizedPhone,
                 isSeenIds: [],
+
                 messageType: "text",
-                isReply: "false",
+                imageUrl: null,
+                audioUrl: null,
                 userType: "customer",
+
+                isReply: false,
+                replyUserId: null,
+                replyMessage: null,
+
                 message: cleanMessage,
+                isWebsite: null,
                 timestamp,
                 isCompleted: false,
+
+                locationLat: null,
+                locationLng: null,
+                thumbnail: "",
             };
 
             publishStomp('/app/sendChatMessage', newChat);
@@ -1023,7 +1250,7 @@ function extractQuotedFromEnv(env) {
         q.videoMessage?.caption ||
         q.documentMessage?.caption ||
         q.documentMessage?.fileName ||
-        (q.locationMessage ? `[location] ${q.locationMessage.name || ''}`.trim() : null) ||
+        (q.locationMessage ? '📍 Yer paylaşımı' : null) ||
         (q.audioMessage?.ptt ? '[voice]' : null) ||
         null;
 
