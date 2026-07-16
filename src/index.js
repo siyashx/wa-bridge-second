@@ -649,8 +649,9 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
          * WHATSAPP REPLY İNTEQRASİYASI
          *
          * - Reply özü LOCATION-dırsa həmişə qəbul olunur.
-         * - Reply özü TEXT-dirsə yalnız isAllowedTextReply() qaydasına
-         *   uyğun olduqda qəbul olunur.
+         * - Cavab verilən mesaj LOCATION-dırsa, bütün text reply-lər qəbul olunur.
+         * - Digər mesajlara verilən TEXT reply yalnız isAllowedTextReply()
+         *   qaydasına uyğun olduqda qəbul olunur.
          * - Cavab verilən mesaj LOCATION-dırsa, onun koordinatı
          *   mövcud replyMessage sahəsində saxlanılır.
          * - DB-yə yalnız mövcud Chat sahələri göndərilir.
@@ -665,7 +666,12 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
             const cleanReplyText = String(textBody || '').trim();
 
+            /*
+             * Konum mesajına verilən BÜTÜN text cavabları qəbul edilir.
+             * Text filtri yalnız konum olmayan mesaja verilmiş text reply üçün işləyir.
+             */
             if (
+                !quotedLoc &&
                 replyType === 'text' &&
                 !isAllowedTextReply(cleanReplyText)
             ) {
