@@ -10,6 +10,7 @@ app.use(express.json({ limit: '2mb' }));
 
 const {
     PORT = 4242,
+    EVOLUTION_API_BASE = 'http://127.0.0.1:18080',
     EVOLUTION_API_KEY,
     TARGET_API_BASE = 'https://mototaksi.az:9898',
     WS_URL = 'wss://mototaksi.az:9898/ws',
@@ -18,6 +19,16 @@ const {
     ANDROID_CHANNEL_ID,
     BLOCKED_PHONES = '',
 } = process.env;
+
+const MOTO_TAKSI_ORDER_GROUP_JID = String(
+    process.env.MOTO_TAKSI_ORDER_GROUP_JID ||
+    '120363408126497995@g.us'
+).trim();
+
+const MOTO_TAKSI_ORDER_GROUP_NAME = String(
+    process.env.MOTO_TAKSI_ORDER_GROUP_NAME ||
+    'Moto Taksi Sifariş Et'
+).trim();
 
 function parseGroupList(value) {
     return new Set(
@@ -200,6 +211,193 @@ function findFirstSnetJidDeep(any) {
     return null;
 }
 
+const evolutionContactNameCache = new Map();
+const EVOLUTION_CONTACT_CACHE_MS = 10 * 60 * 1000;
+const EVOLUTION_CONTACT_MISS_CACHE_MS = 60 * 1000;
+
+function normalizeEvolutionResultList(payload) {
+    if (Array.isArray(payload)) return payload;
+
+    const candidates = [
+        payload?.contacts,
+        payload?.chats,
+        payload?.data,
+        payload?.records,
+        payload?.result,
+    ];
+
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) return candidate;
+    }
+
+    if (payload && typeof payload === 'object') {
+        return [payload];
+    }
+
+    return [];
+}
+
+function cleanEvolutionContactName(value, phone) {
+    const name = String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!name) return null;
+
+    const onlyDigits = name.replace(/\D/g, '');
+    const normalizedPhone = String(phone || '').replace(/\D/g, '');
+
+    if (
+        normalizedPhone &&
+        onlyDigits &&
+        onlyDigits === normalizedPhone
+    ) {
+        return null;
+    }
+
+    if (
+        name.endsWith('@s.whatsapp.net') ||
+        name.endsWith('@lid')
+    ) {
+        return null;
+    }
+
+    return name;
+}
+
+async function resolveEvolutionContactName(instanceName, phone) {
+    const normalizedPhone = String(phone || '')
+        .replace(/\D/g, '');
+
+    if (!instanceName || !normalizedPhone) {
+        return null;
+    }
+
+    const cacheKey = `${instanceName}:${normalizedPhone}`;
+    const cached = evolutionContactNameCache.get(cacheKey);
+
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.name;
+    }
+
+    const remoteJid = `${normalizedPhone}@s.whatsapp.net`;
+    const urlBase = String(EVOLUTION_API_BASE || '')
+        .replace(/\/+$/, '');
+
+    if (!urlBase || !EVOLUTION_API_KEY) {
+        return null;
+    }
+
+    const requestConfig = {
+        headers: {
+            apikey: EVOLUTION_API_KEY,
+            'Content-Type': 'application/json',
+        },
+        timeout: 8000,
+    };
+
+    const query = {
+        where: {
+            remoteJid,
+        },
+    };
+
+    try {
+        const [contactsResult, chatsResult] =
+            await Promise.allSettled([
+                axios.post(
+                    `${urlBase}/chat/findContacts/${encodeURIComponent(instanceName)}`,
+                    query,
+                    requestConfig
+                ),
+                axios.post(
+                    `${urlBase}/chat/findChats/${encodeURIComponent(instanceName)}`,
+                    query,
+                    requestConfig
+                ),
+            ]);
+
+        const contacts = contactsResult.status === 'fulfilled'
+            ? normalizeEvolutionResultList(
+                contactsResult.value?.data
+            )
+            : [];
+
+        const chats = chatsResult.status === 'fulfilled'
+            ? normalizeEvolutionResultList(
+                chatsResult.value?.data
+            )
+            : [];
+
+        const sameRemoteJid = (item) => (
+            String(
+                item?.remoteJid ||
+                item?.jid ||
+                item?.id ||
+                ''
+            ) === remoteJid
+        );
+
+        const contact =
+            contacts.find(sameRemoteJid) ||
+            contacts[0] ||
+            null;
+
+        const chat =
+            chats.find(sameRemoteJid) ||
+            chats[0] ||
+            null;
+
+        const nameCandidates = [
+            chat?.name,
+            contact?.name,
+            contact?.notify,
+            contact?.verifiedName,
+            contact?.pushName,
+            chat?.pushName,
+        ];
+
+        let resolvedName = null;
+
+        for (const candidate of nameCandidates) {
+            resolvedName = cleanEvolutionContactName(
+                candidate,
+                normalizedPhone
+            );
+
+            if (resolvedName) break;
+        }
+
+        evolutionContactNameCache.set(cacheKey, {
+            name: resolvedName,
+            expiresAt:
+                Date.now() +
+                (
+                    resolvedName
+                        ? EVOLUTION_CONTACT_CACHE_MS
+                        : EVOLUTION_CONTACT_MISS_CACHE_MS
+                ),
+        });
+
+        return resolvedName;
+    } catch (error) {
+        console.error(
+            '[MOTO CONTACT] Evolution kontakt adı alınmadı:',
+            error?.response?.status,
+            error?.response?.data || error?.message
+        );
+
+        evolutionContactNameCache.set(cacheKey, {
+            name: null,
+            expiresAt:
+                Date.now() +
+                EVOLUTION_CONTACT_MISS_CACHE_MS,
+        });
+
+        return null;
+    }
+}
+
 function normalizeEnvelope(data) {
     // Evolution bəzən:
     // data = { messages: [ ... ] }
@@ -246,6 +444,14 @@ function normalizeEnvelope(data) {
         root.sender ||
         null;
 
+    const participantAlt =
+        key.participantAlt ||
+        env.participantAlt ||
+        root.participantAlt ||
+        env?.key?.participantAlt ||
+        root?.key?.participantAlt ||
+        null;
+
     const id =
         key.id ||
         env.id ||
@@ -286,6 +492,7 @@ function normalizeEnvelope(data) {
         msg,
         remoteJid,
         participant,
+        participantAlt,
         id,
         fromMe,
         contextInfo,        // ✅ əlavə et
@@ -552,6 +759,8 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
         }
 
         const allowedGroupsForInstance = INSTANCE_GROUPS.get(instanceName);
+        const isMotoTaksiOrderGroup =
+            env.remoteJid === MOTO_TAKSI_ORDER_GROUP_JID;
 
         if (!allowedGroupsForInstance) {
             console.log('SKIP: unknown Evolution instance', {
@@ -561,11 +770,16 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             return;
         }
 
-        if (!allowedGroupsForInstance.has(env.remoteJid)) {
+        if (
+            !allowedGroupsForInstance.has(env.remoteJid) &&
+            !isMotoTaksiOrderGroup
+        ) {
             console.log('SKIP: group not allowed for instance', {
                 instanceName,
                 remoteJid: env.remoteJid,
                 allowedGroups: [...allowedGroupsForInstance],
+                motoTaksiOrderGroup:
+                    MOTO_TAKSI_ORDER_GROUP_JID,
             });
             return;
         }
@@ -625,19 +839,50 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             return;
         }
 
-        // ✅ Telefonu çıxar: üstünlük BODY-dəki @s.whatsapp.net, sonra participant, sonra @lid
+        /*
+         * Telefon üçün əvvəl participantAlt istifadə olunur.
+         * LID addressing zamanı real WhatsApp nömrəsi burada gəlir.
+         */
         const foundSnet = findFirstSnetJidDeep(req.body);
 
         let phone =
-            parsePhoneFromSNetJid(foundSnet) ||
-            parsePhoneFromSNetJid(env.participant);
+            parsePhoneFromSNetJid(env.participantAlt) ||
+            parsePhoneFromSNetJid(env.participant) ||
+            parsePhoneFromSNetJid(foundSnet);
 
-        if (!phone) phone = parseDigitsFromLid(env.participant);
+        if (!phone && !isMotoTaksiOrderGroup) {
+            phone = parseDigitsFromLid(env.participant);
+        }
 
         // ✅ Bloklanmış nömrə -> tam skip, newChat-a getmir
         if (phone && BLOCKED_PHONES_SET.has(phone)) {
             console.log('SKIP: blocked phone', { phone });
             return;
+        }
+
+        const targetGroupId =
+            isMotoTaksiOrderGroup ? "1" : "0";
+
+        let targetUsername =
+            "Sifariş Qrupu İstifadəçisi";
+
+        if (isMotoTaksiOrderGroup) {
+            const evolutionContactName =
+                await resolveEvolutionContactName(
+                    instanceName,
+                    phone
+                );
+
+            targetUsername =
+                evolutionContactName ||
+                "Moto Taksi İstifadəçisi";
+
+            console.log('[MOTO CONTACT] username resolved', {
+                phone: phone ? `+${phone}` : '',
+                username: targetUsername,
+                foundInEvolutionContacts:
+                    !!evolutionContactName,
+            });
         }
 
         // əvvəl text-i çıxar (reply olsa belə conversation içində olur)
@@ -715,9 +960,9 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
                 const locationReplyChat = {
                     id: Date.now(),
-                    groupId: "0",
+                    groupId: targetGroupId,
                     userId: 2,
-                    username: "Sifariş Qrupu İstifadəçisi",
+                    username: targetUsername,
                     phone: normalizedPhone,
                     isSeenIds: [],
 
@@ -758,9 +1003,9 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
             const textReplyChat = {
                 id: Date.now(),
-                groupId: "0",
+                groupId: targetGroupId,
                 userId: 2,
-                username: "Sifariş Qrupu İstifadəçisi",
+                username: targetUsername,
                 phone: normalizedPhone,
                 isSeenIds: [],
 
@@ -812,13 +1057,11 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
         if (shouldHandleAsLocation && effectiveLoc) {
             const timestamp = formatBakuTimestamp();
 
-            const normalizedPhone =
-                (parsePhoneFromSNetJid(foundSnet) ||
-                    parsePhoneFromSNetJid(env.participant) ||
-                    parseDigitsFromLid(env.participant) ||
-                    '');
+            const normalizedPhone = phone || '';
 
-            const phonePrefixed = normalizedPhone ? `+${normalizedPhone}`.replace('++', '+') : '';
+            const phonePrefixed = normalizedPhone
+                ? `+${normalizedPhone}`.replace('++', '+')
+                : '';
 
             const locationTitle =
                 (effectiveLoc.caption && effectiveLoc.caption.trim()) ? effectiveLoc.caption :
@@ -854,9 +1097,9 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
                 const newChat = {
                     id: Date.now(),
-                    groupId: "0",
+                    groupId: targetGroupId,
                     userId: 2,
-                    username: "Sifariş Qrupu İstifadəçisi",
+                    username: targetUsername,
                     phone: phonePrefixed,
                     isSeenIds: [],
 
@@ -939,9 +1182,9 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             // ✅ BACKEND/STOMP newChat (text)
             const newChat = {
                 id: Date.now(),
-                groupId: "0",
+                groupId: targetGroupId,
                 userId: 2,
-                username: 'Sifariş Qrupu İstifadəçisi',
+                username: targetUsername,
                 phone: normalizedPhone,
                 isSeenIds: [],
 
@@ -1215,7 +1458,11 @@ async function incrementTodayGroupCount(
 
     const groupName =
         GROUP_DISPLAY_NAMES[groupJid] ||
-        `Naməlum qrup (${groupJid})`;
+        (
+            groupJid === MOTO_TAKSI_ORDER_GROUP_JID
+                ? MOTO_TAKSI_ORDER_GROUP_NAME
+                : `Naməlum qrup (${groupJid})`
+        );
 
     try {
         await axios.post(
