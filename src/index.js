@@ -30,6 +30,11 @@ const MOTO_TAKSI_ORDER_GROUP_NAME = String(
     'Moto Taksi Sifariş Et'
 ).trim();
 
+const MOTO_TAKSI_ANDROID_CHANNEL_ID = String(
+    process.env.MOTO_TAKSI_ANDROID_CHANNEL_ID ||
+    'f737e363-a9c4-4d72-a3c0-af521f13fe78'
+).trim();
+
 function parseGroupList(value) {
     return new Set(
         String(value || '')
@@ -265,6 +270,104 @@ function cleanEvolutionContactName(value, phone) {
     return name;
 }
 
+function normalizeEvolutionContactPhone(value) {
+    const raw = String(value || '').trim();
+
+    if (!raw) return '';
+
+    const snetPhone = parsePhoneFromSNetJid(raw);
+
+    if (snetPhone) {
+        return snetPhone;
+    }
+
+    /*
+     * remoteJid, number və phoneNumber kimi sahələrdə
+     * yalnız telefon rəqəmlərini saxlayırıq.
+     */
+    return raw.replace(/\D/g, '');
+}
+
+function evolutionContactMatchesPhone(
+    item,
+    normalizedPhone,
+    remoteJid
+) {
+    if (!item) return false;
+
+    const identifiers = [
+        item.remoteJid,
+        item.remoteJidAlt,
+        item.jid,
+        item.id,
+        item.number,
+        item.phoneNumber,
+        item.owner,
+    ];
+
+    return identifiers.some((identifier) => {
+        const rawIdentifier =
+            String(identifier || '').trim();
+
+        if (!rawIdentifier) {
+            return false;
+        }
+
+        if (rawIdentifier === remoteJid) {
+            return true;
+        }
+
+        return (
+            normalizeEvolutionContactPhone(
+                rawIdentifier
+            ) === normalizedPhone
+        );
+    });
+}
+
+function resolveSavedEvolutionContactName(
+    contact,
+    chat,
+    phone
+) {
+    /*
+     * pushName / notify / verifiedName istifadə edilmir.
+     * Bunlar şəxsin öz WhatsApp profil adı ola bilər.
+     *
+     * İstifadəçinin öz kontakt siyahısında saxladığı ad üçün
+     * contact.name əsas mənbədir. Chat adı yalnız Evolution
+     * həmin chatı saved kimi işarələyibsə ehtiyat mənbədir.
+     */
+    const savedNameCandidates = [
+        contact?.name,
+        contact?.savedName,
+        contact?.fullName,
+        chat?.isSaved === true
+            ? chat?.name
+            : null,
+        chat?.isSaved === true
+            ? chat?.savedName
+            : null,
+        chat?.isSaved === true
+            ? chat?.fullName
+            : null,
+    ];
+
+    for (const candidate of savedNameCandidates) {
+        const cleanName =
+            cleanEvolutionContactName(
+                candidate,
+                phone
+            );
+
+        if (cleanName) {
+            return cleanName;
+        }
+    }
+
+    return null;
+}
+
 async function resolveEvolutionContactName(instanceName, phone) {
     const normalizedPhone = String(phone || '')
         .replace(/\D/g, '');
@@ -329,44 +432,45 @@ async function resolveEvolutionContactName(instanceName, phone) {
             )
             : [];
 
-        const sameRemoteJid = (item) => (
-            String(
-                item?.remoteJid ||
-                item?.jid ||
-                item?.id ||
-                ''
-            ) === remoteJid
-        );
+        const matchesPhone = (item) =>
+            evolutionContactMatchesPhone(
+                item,
+                normalizedPhone,
+                remoteJid
+            );
 
+        /*
+         * contacts[0] və chats[0] fallback-i qəsdən yoxdur.
+         * Evolution filteri işləməsə və bütün kontaktları qaytarsa,
+         * ilk kontaktın adı səhv şəxsə yazılmasın.
+         */
         const contact =
-            contacts.find(sameRemoteJid) ||
-            contacts[0] ||
+            contacts.find(matchesPhone) ||
             null;
 
         const chat =
-            chats.find(sameRemoteJid) ||
-            chats[0] ||
+            chats.find(matchesPhone) ||
             null;
 
-        const nameCandidates = [
-            chat?.name,
-            contact?.name,
-            contact?.notify,
-            contact?.verifiedName,
-            contact?.pushName,
-            chat?.pushName,
-        ];
-
-        let resolvedName = null;
-
-        for (const candidate of nameCandidates) {
-            resolvedName = cleanEvolutionContactName(
-                candidate,
+        const resolvedName =
+            resolveSavedEvolutionContactName(
+                contact,
+                chat,
                 normalizedPhone
             );
 
-            if (resolvedName) break;
-        }
+        console.log(
+            '[MOTO CONTACT] saved contact lookup',
+            {
+                phone: `+${normalizedPhone}`,
+                contactMatched: !!contact,
+                chatMatched: !!chat,
+                chatIsSaved:
+                    chat?.isSaved === true,
+                savedNameFound:
+                    !!resolvedName,
+            }
+        );
 
         evolutionContactNameCache.set(cacheKey, {
             name: resolvedName,
@@ -912,7 +1016,29 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             const cleanReplyText = String(textBody || '').trim();
 
             /*
-             * Konum mesajına verilən BÜTÜN text cavabları qəbul edilir.
+             * Konuma cavab veriləndə yalnız + işarəsindən ibarət
+             * mesaj sifariş kimi tətbiqə ötürülmür.
+             * Bir və ya bir neçə "+" eyni qayda ilə bloklanır.
+             */
+            const isOnlyPlusLocationReply =
+                !!quotedLoc &&
+                replyType === 'text' &&
+                /^\++$/.test(
+                    cleanReplyText.normalize('NFKC')
+                );
+
+            if (isOnlyPlusLocationReply) {
+                console.log(
+                    'SKIP LOCATION TEXT REPLY: yalnız + işarəsidir',
+                    {
+                        text: cleanReplyText,
+                    }
+                );
+                return;
+            }
+
+            /*
+             * Konum mesajına verilən digər text cavabları qəbul edilir.
              * Text filtri yalnız konum olmayan mesaja verilmiş text reply üçün işləyir.
              */
             if (
@@ -1142,7 +1268,12 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                             ? newChat.message.slice(0, 140)
                             : `${effectiveLoc.lat.toFixed(6)}, ${effectiveLoc.lng.toFixed(6)}`;
 
-                        await sendPushNotification(oneSignalIds, '🪄🪄 Yeni Sifariş!!', `📍 ${preview}`);
+                        await sendPushNotification(
+                            oneSignalIds,
+                            '🪄🪄 Yeni Sifariş!!',
+                            `📍 ${preview}`,
+                            targetGroupId
+                        );
                     }
                 } catch (e) { }
             }
@@ -1219,7 +1350,12 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 const oneSignalIds = await fetchPushTargets(0);
                 if (oneSignalIds.length) {
                     const preview = (cleanMessage || '').slice(0, 140);
-                    await sendPushNotification(oneSignalIds, '🪄🪄 Yeni Sifariş!!', `📩 ${preview}`);
+                    await sendPushNotification(
+                        oneSignalIds,
+                        '🪄🪄 Yeni Sifariş!!',
+                        `📩 ${preview}`,
+                        targetGroupId
+                    );
                 }
             } catch (e) { }
         }
@@ -1255,7 +1391,20 @@ function toBase64Thumb(jpegThumbnail) {
     return null;
 }
 
-async function sendPushNotification(ids, title, body) {
+async function sendPushNotification(
+    ids,
+    title,
+    body,
+    groupId = "0"
+) {
+    const normalizedGroupId =
+        String(groupId ?? "0");
+
+    const selectedAndroidChannelId =
+        normalizedGroupId === "1"
+            ? MOTO_TAKSI_ANDROID_CHANNEL_ID
+            : ANDROID_CHANNEL_ID;
+
     // normalize incoming ids and keep only valid OneSignal UUIDs
     const input = (Array.isArray(ids) ? ids : [ids]).map(x => String(x || '').trim());
     const validInput = [...new Set(input.filter(isValidUUID))];
@@ -1296,9 +1445,22 @@ async function sendPushNotification(ids, title, body) {
         include_subscription_ids: v25Ids,
         headings: { en: title },
         contents: { en: body },
-        android_channel_id: ANDROID_CHANNEL_ID,
-        data: { screen: 'OrderGroup', groupId: 1 },
+        android_channel_id:
+            selectedAndroidChannelId,
+        data: {
+            screen: 'OrderGroup',
+            groupId:
+                normalizedGroupId === "1"
+                    ? 1
+                    : 0,
+        },
     };
+
+    console.log('[PUSH CHANNEL]', {
+        groupId: normalizedGroupId,
+        androidChannelId:
+            selectedAndroidChannelId,
+    });
 
     const fire = async (tag) => {
         try {
