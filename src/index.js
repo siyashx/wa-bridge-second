@@ -967,27 +967,11 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
         const targetGroupId =
             isMotoTaksiOrderGroup ? "1" : "0";
 
-        let targetUsername =
-            "Sifariş Qrupu İstifadəçisi";
+        const targetUsername =
+            isMotoTaksiOrderGroup
+                ? "Xanım Müştəri"
+                : "Sifariş Qrupu İstifadəçisi";
 
-        if (isMotoTaksiOrderGroup) {
-            const evolutionContactName =
-                await resolveEvolutionContactName(
-                    instanceName,
-                    phone
-                );
-
-            targetUsername =
-                evolutionContactName ||
-                "Moto Taksi İstifadəçisi";
-
-            console.log('[MOTO CONTACT] username resolved', {
-                phone: phone ? `+${phone}` : '',
-                username: targetUsername,
-                foundInEvolutionContacts:
-                    !!evolutionContactName,
-            });
-        }
 
         // əvvəl text-i çıxar (reply olsa belə conversation içində olur)
         const textBody = extractText(env.msg);
