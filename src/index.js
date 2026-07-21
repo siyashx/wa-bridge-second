@@ -1576,7 +1576,8 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
                 await incrementTodayGroupCount(
                     instanceName,
-                    env.remoteJid
+                    env.remoteJid,
+                    phonePrefixed
                 );
 
                 try {
@@ -1660,7 +1661,8 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
             await incrementTodayGroupCount(
                 instanceName,
-                env.remoteJid
+                env.remoteJid,
+                normalizedPhone
             );
 
             // ✅ OneSignal push (yalnız non-reply)
@@ -1929,10 +1931,13 @@ function getBakuDateString(date = new Date()) {
 
 async function incrementTodayGroupCount(
     instanceName,
-    groupJid
+    groupJid,
+    phone = ''
 ) {
     if (!instanceName || !groupJid) {
-        console.error('[GROUP COUNTER] instanceName və ya groupJid yoxdur');
+        console.error(
+            '[GROUP COUNTER] instanceName və ya groupJid yoxdur'
+        );
         return;
     }
 
@@ -1944,6 +1949,14 @@ async function incrementTodayGroupCount(
                 : `Naməlum qrup (${groupJid})`
         );
 
+    /*
+     * Backend qrup sayını həmişə artırır.
+     * Telefon müəyyən edilibsə, eyni sorğuda istifadəçi
+     * statistikası da artırılır.
+     */
+    const normalizedPhone =
+        normalizePhoneDigits(phone);
+
     try {
         await axios.post(
             `${TARGET_API_BASE}/api/v5/whatsapp-group-stats/increment`,
@@ -1951,6 +1964,9 @@ async function incrementTodayGroupCount(
                 instanceName,
                 groupJid,
                 groupName,
+                phone:
+                    normalizedPhone ||
+                    null,
             },
             {
                 timeout: 10000,
@@ -1961,6 +1977,10 @@ async function incrementTodayGroupCount(
             instanceName,
             groupJid,
             groupName,
+            phone:
+                normalizedPhone
+                    ? `+${normalizedPhone}`
+                    : null,
         });
     } catch (error) {
         console.error(
