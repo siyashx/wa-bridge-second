@@ -190,6 +190,263 @@ function parseDigitsFromLid(jid) {
     return out;
 }
 
+
+function normalizePhoneDigits(value) {
+    return String(value || '').replace(/\D/g, '');
+}
+
+/*
+ * Hər instance-a qoşulmuş şəxsi nömrə.
+ * Bunlar heç vaxt qrup mesajının müəllifi kimi DB-yə yazılmamalıdır.
+ */
+const INSTANCE_SELF_PHONES = new Map(
+    [
+        [
+            String(process.env.EVOLUTION_INSTANCE_1 || '').trim(),
+            normalizePhoneDigits(
+                process.env.EVOLUTION_INSTANCE_1_PHONE || ''
+            ),
+        ],
+        [
+            String(process.env.EVOLUTION_INSTANCE_2 || '').trim(),
+            normalizePhoneDigits(
+                process.env.EVOLUTION_INSTANCE_2_PHONE || ''
+            ),
+        ],
+    ].filter(([instanceName, phone]) => instanceName && phone)
+);
+
+function getDirectSenderJidCandidates(reqBody, env) {
+    const candidates = [
+        env?.participantAlt,
+        env?.participant,
+        env?.key?.participantAlt,
+        env?.key?.participant,
+        env?.raw?.participantAlt,
+        env?.raw?.participant,
+        reqBody?.data?.key?.participantAlt,
+        reqBody?.data?.key?.participant,
+        reqBody?.data?.participantAlt,
+        reqBody?.data?.participant,
+        reqBody?.key?.participantAlt,
+        reqBody?.key?.participant,
+        reqBody?.participantAlt,
+        reqBody?.participant,
+    ];
+
+    return [
+        ...new Set(
+            candidates
+                .map(value => String(value || '').trim())
+                .filter(Boolean)
+        ),
+    ];
+}
+
+function extractPhoneFromSpecificEvolutionItem(
+    item,
+    selfPhone,
+    lidDigits
+) {
+    if (!item || typeof item !== 'object') {
+        return null;
+    }
+
+    /*
+     * Yalnız telefon nömrəsini ifadə edə bilən konkret sahələrə baxırıq.
+     * Bütün obyekt üzrə deep-search etmirik; owner/session nömrəsi qarışmasın.
+     */
+    const jidCandidates = [
+        item.remoteJidAlt,
+        item.participantAlt,
+        item.jidAlt,
+        item.pn,
+        item.phoneJid,
+    ];
+
+    for (const value of jidCandidates) {
+        const phone = parsePhoneFromSNetJid(value);
+
+        if (
+            phone &&
+            phone !== selfPhone &&
+            phone !== lidDigits
+        ) {
+            return phone;
+        }
+    }
+
+    const digitCandidates = [
+        item.phoneNumber,
+        item.number,
+    ];
+
+    for (const value of digitCandidates) {
+        const phone = normalizePhoneDigits(value);
+
+        if (
+            /^\d{8,15}$/.test(phone) &&
+            phone !== selfPhone &&
+            phone !== lidDigits
+        ) {
+            return phone;
+        }
+    }
+
+    return null;
+}
+
+const evolutionLidPhoneCache = new Map();
+const EVOLUTION_LID_PHONE_CACHE_MS = 10 * 60 * 1000;
+const EVOLUTION_LID_PHONE_MISS_CACHE_MS = 60 * 1000;
+
+async function resolvePhoneFromLid(
+    instanceName,
+    lidJid,
+    selfPhone = ''
+) {
+    const normalizedLid = String(lidJid || '').trim();
+
+    if (
+        !instanceName ||
+        !/^\d+@lid$/.test(normalizedLid) ||
+        !EVOLUTION_API_BASE ||
+        !EVOLUTION_API_KEY
+    ) {
+        return null;
+    }
+
+    const cacheKey = `${instanceName}:${normalizedLid}`;
+    const cached = evolutionLidPhoneCache.get(cacheKey);
+
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.phone;
+    }
+
+    const urlBase = String(EVOLUTION_API_BASE)
+        .replace(/\/+$/, '');
+
+    const requestConfig = {
+        headers: {
+            apikey: EVOLUTION_API_KEY,
+            'Content-Type': 'application/json',
+        },
+        timeout: 8000,
+    };
+
+    const query = {
+        where: {
+            remoteJid: normalizedLid,
+        },
+    };
+
+    try {
+        const [contactsResult, chatsResult] =
+            await Promise.allSettled([
+                axios.post(
+                    `${urlBase}/chat/findContacts/${encodeURIComponent(instanceName)}`,
+                    query,
+                    requestConfig
+                ),
+                axios.post(
+                    `${urlBase}/chat/findChats/${encodeURIComponent(instanceName)}`,
+                    query,
+                    requestConfig
+                ),
+            ]);
+
+        const contacts =
+            contactsResult.status === 'fulfilled'
+                ? normalizeEvolutionResultList(
+                    contactsResult.value?.data
+                )
+                : [];
+
+        const chats =
+            chatsResult.status === 'fulfilled'
+                ? normalizeEvolutionResultList(
+                    chatsResult.value?.data
+                )
+                : [];
+
+        const allItems = [...contacts, ...chats];
+        const lidDigits = parseDigitsFromLid(normalizedLid);
+
+        const matchingItems = allItems.filter((item) => {
+            const ids = [
+                item?.remoteJid,
+                item?.jid,
+                item?.id,
+                item?.lid,
+            ]
+                .map(value => String(value || '').trim())
+                .filter(Boolean);
+
+            return ids.includes(normalizedLid);
+        });
+
+        /*
+         * Endpoint filteri işləməsə və bütün kontaktları qaytarsa,
+         * əlaqəsiz ilk kontaktın nömrəsini götürmürük.
+         */
+        const orderedItems = matchingItems;
+
+        let resolvedPhone = null;
+
+        for (const item of orderedItems) {
+            resolvedPhone =
+                extractPhoneFromSpecificEvolutionItem(
+                    item,
+                    selfPhone,
+                    lidDigits
+                );
+
+            if (resolvedPhone) {
+                break;
+            }
+        }
+
+        evolutionLidPhoneCache.set(cacheKey, {
+            phone: resolvedPhone,
+            expiresAt:
+                Date.now() +
+                (
+                    resolvedPhone
+                        ? EVOLUTION_LID_PHONE_CACHE_MS
+                        : EVOLUTION_LID_PHONE_MISS_CACHE_MS
+                ),
+        });
+
+        console.log('[PHONE RESOLVE] LID lookup', {
+            instanceName,
+            lidJid: normalizedLid,
+            contactsCount: contacts.length,
+            chatsCount: chats.length,
+            resolvedPhone:
+                resolvedPhone
+                    ? `+${resolvedPhone}`
+                    : null,
+        });
+
+        return resolvedPhone;
+    } catch (error) {
+        console.error(
+            '[PHONE RESOLVE] LID lookup failed:',
+            error?.response?.status,
+            error?.response?.data || error?.message
+        );
+
+        evolutionLidPhoneCache.set(cacheKey, {
+            phone: null,
+            expiresAt:
+                Date.now() +
+                EVOLUTION_LID_PHONE_MISS_CACHE_MS,
+        });
+
+        return null;
+    }
+}
+
 // JSON içində ilk s.whatsapp.net JID-ni tap
 function findFirstSnetJidDeep(any) {
     if (any == null) return null;
@@ -539,13 +796,17 @@ function normalizeEnvelope(data) {
         root.chatId ||
         null;
 
+    /*
+     * Qrup mesajında göndərici yalnız participant sahələrindən götürülür.
+     * env.sender / env.from / root.sender istifadə edilmir:
+     * həmin sahələr bəzi Evolution payload-larında instance sahibinin JID-i ola bilər.
+     */
     const participant =
         key.participant ||
         env.participant ||
-        env.sender ||
-        env.from ||
         root.participant ||
-        root.sender ||
+        env?.key?.participant ||
+        root?.key?.participant ||
         null;
 
     const participantAlt =
@@ -944,19 +1205,92 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
         }
 
         /*
-         * Telefon üçün əvvəl participantAlt istifadə olunur.
-         * LID addressing zamanı real WhatsApp nömrəsi burada gəlir.
+         * Telefon yalnız mesaj müəllifinə aid participant sahələrindən götürülür.
+         * req.body daxilində deep-search YOXDUR: o, instance sahibinin nömrəsini
+         * səhvən tapıb DB-yə yazırdı.
          */
-        const foundSnet = findFirstSnetJidDeep(req.body);
+        const senderJidCandidates =
+            getDirectSenderJidCandidates(
+                req.body,
+                env
+            );
 
-        let phone =
-            parsePhoneFromSNetJid(env.participantAlt) ||
-            parsePhoneFromSNetJid(env.participant) ||
-            parsePhoneFromSNetJid(foundSnet);
+        const instanceSelfPhone =
+            INSTANCE_SELF_PHONES.get(instanceName) ||
+            '';
 
-        if (!phone && !isMotoTaksiOrderGroup) {
-            phone = parseDigitsFromLid(env.participant);
+        let phone = null;
+
+        for (const senderJid of senderJidCandidates) {
+            const candidatePhone =
+                parsePhoneFromSNetJid(senderJid);
+
+            if (
+                candidatePhone &&
+                candidatePhone !== instanceSelfPhone
+            ) {
+                phone = candidatePhone;
+                break;
+            }
         }
+
+        /*
+         * participant yalnız @lid-dirsə, LID rəqəmlərini telefon kimi yazmırıq.
+         * Evolution contacts/chats məlumatından remoteJidAlt/phoneNumber tapmağa çalışırıq.
+         */
+        if (!phone) {
+            const lidJid =
+                senderJidCandidates.find(
+                    value =>
+                        /^\d+@lid$/.test(value)
+                ) ||
+                null;
+
+            if (lidJid) {
+                phone = await resolvePhoneFromLid(
+                    instanceName,
+                    lidJid,
+                    instanceSelfPhone
+                );
+            }
+        }
+
+        /*
+         * Son təhlükəsizlik qatı: hansı səbəbdənsə öz nömrəmiz çıxarsa,
+         * onu saxlamırıq. Nömrə tapılmayanda phone boş qalacaq.
+         */
+        if (
+            phone &&
+            instanceSelfPhone &&
+            phone === instanceSelfPhone
+        ) {
+            console.error(
+                '[PHONE RESOLVE] self phone rejected',
+                {
+                    instanceName,
+                    phone: `+${phone}`,
+                    senderJidCandidates,
+                }
+            );
+
+            phone = null;
+        }
+
+        console.log('[PHONE RESOLVE] result', {
+            instanceName,
+            participant: env?.participant || null,
+            participantAlt:
+                env?.participantAlt || null,
+            senderJidCandidates,
+            selfPhone:
+                instanceSelfPhone
+                    ? `+${instanceSelfPhone}`
+                    : null,
+            resolvedPhone:
+                phone
+                    ? `+${phone}`
+                    : null,
+        });
 
         // ✅ Bloklanmış nömrə -> tam skip, newChat-a getmir
         if (phone && BLOCKED_PHONES_SET.has(phone)) {
