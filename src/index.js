@@ -1741,8 +1741,6 @@ async function sendPushNotification(
         const v25Set = new Set(
             users
                 .filter(u =>
-                    Number(u?.appVersion) >= 25 &&
-                    u?.hasActiveApp !== 'mototaxi' &&      // ✅ YENİ ŞƏRT
                     u?.oneSignal &&
                     isValidUUID(String(u.oneSignal))
                 )
