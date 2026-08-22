@@ -4,6 +4,8 @@ import express from 'express';
 import axios from 'axios';
 import { Client } from '@stomp/stompjs';
 import WebSocket from 'ws';
+import { mkdir, appendFile } from 'node:fs/promises';
+import path from 'node:path';
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -18,6 +20,9 @@ const {
     ONE_SIGNAL_REST_API_KEY,
     ANDROID_CHANNEL_ID,
     BLOCKED_PHONES = '',
+    MISSING_PHONE_AUDIT = '1',
+    MISSING_PHONE_LOG_DIR = './logs/missing-phone',
+    MISSING_PHONE_SAVE_RAW = '1',
 } = process.env;
 
 const MOTO_TAKSI_ORDER_GROUP_JID = String(
@@ -152,6 +157,174 @@ function shortJson(x, limit = 1200) {
 function dbgLoc(...args) {
     if (process.env.DEBUG_LOCATION === '1') {
         console.log('[LOC]', ...args);
+    }
+}
+
+
+/* ---------------- missing-phone diagnostics ---------------- */
+
+const DIAGNOSTIC_SECRET_KEY_RE =
+    /(apikey|api[_-]?key|authorization|token|secret|password|cookie)/i;
+
+function sanitizeDiagnosticValue(value, depth = 0) {
+    if (value == null) return value;
+
+    if (depth > 10) return '[max-depth]';
+
+    if (typeof value === 'string') {
+        return value.length > 12000
+            ? `${value.slice(0, 12000)}…[truncated]`
+            : value;
+    }
+
+    if (
+        typeof value === 'number' ||
+        typeof value === 'boolean'
+    ) {
+        return value;
+    }
+
+    if (Array.isArray(value)) {
+        return value
+            .slice(0, 100)
+            .map(item => sanitizeDiagnosticValue(item, depth + 1));
+    }
+
+    if (typeof value === 'object') {
+        const out = {};
+
+        for (const [key, item] of Object.entries(value)) {
+            out[key] = DIAGNOSTIC_SECRET_KEY_RE.test(key)
+                ? '[REDACTED]'
+                : sanitizeDiagnosticValue(item, depth + 1);
+        }
+
+        return out;
+    }
+
+    return String(value);
+}
+
+function getMissingPhoneFailureReason({
+    senderJidCandidates,
+    lidDiagnostic,
+    selfPhoneRejected,
+}) {
+    if (selfPhoneRejected) {
+        return 'resolved_to_instance_self_phone';
+    }
+
+    if (!senderJidCandidates?.length) {
+        return 'no_sender_jid_candidates';
+    }
+
+    const hasLid = senderJidCandidates.some(value => /^\d+@lid$/.test(value));
+    const hasSnet = senderJidCandidates.some(value => /@s\.whatsapp\.net$/.test(value));
+
+    if (hasLid) {
+        if (lidDiagnostic?.cacheHit && !lidDiagnostic?.resolvedPhone) {
+            return lidDiagnostic?.failureReason || 'lid_lookup_cached_miss';
+        }
+
+        if (lidDiagnostic?.requestFailed) {
+            return 'lid_lookup_request_failed';
+        }
+
+        if (lidDiagnostic?.matchingItemsCount === 0) {
+            return 'lid_lookup_no_matching_contact_or_chat';
+        }
+
+        if (
+            Number(lidDiagnostic?.matchingItemsCount || 0) > 0 &&
+            !lidDiagnostic?.resolvedPhone
+        ) {
+            return 'lid_lookup_match_without_phone_fields';
+        }
+
+        return lidDiagnostic?.failureReason || 'lid_lookup_unresolved';
+    }
+
+    if (hasSnet) {
+        return 'snet_candidates_rejected_or_invalid';
+    }
+
+    return 'unsupported_sender_jid_format';
+}
+
+async function persistMissingPhoneCase({
+    req,
+    env,
+    instanceName,
+    senderJidCandidates,
+    instanceSelfPhone,
+    lidDiagnostic,
+    selfPhoneRejected,
+    outboundPayload,
+    flow,
+}) {
+    if (String(MISSING_PHONE_AUDIT) !== '1') return;
+
+    try {
+        const createdAt = new Date().toISOString();
+        const bakuTimestamp = formatBakuTimestamp();
+        const day = bakuTimestamp.slice(0, 10);
+        const logDir = path.resolve(process.cwd(), MISSING_PHONE_LOG_DIR);
+        const filePath = path.join(logDir, `${day}.jsonl`);
+
+        const failureReason = getMissingPhoneFailureReason({
+            senderJidCandidates,
+            lidDiagnostic,
+            selfPhoneRejected,
+        });
+
+        const record = {
+            schemaVersion: 1,
+            type: 'missing_phone',
+            createdAt,
+            bakuTimestamp,
+            failureReason,
+            flow,
+            instanceName,
+            messageId: env?.id || null,
+            remoteJid: env?.remoteJid || null,
+            participant: env?.participant || null,
+            participantAlt: env?.participantAlt || null,
+            senderJidCandidates,
+            instanceSelfPhone: instanceSelfPhone
+                ? `+${instanceSelfPhone}`
+                : null,
+            selfPhoneRejected: !!selfPhoneRejected,
+            lidDiagnostic: sanitizeDiagnosticValue(lidDiagnostic),
+            outboundPayload: sanitizeDiagnosticValue(outboundPayload),
+            webhook: {
+                path: req?.originalUrl || null,
+                event: req?.body?.event || null,
+                headers: sanitizeDiagnosticValue(pickHeaders(req)),
+                rawBody:
+                    String(MISSING_PHONE_SAVE_RAW) === '1'
+                        ? sanitizeDiagnosticValue(req?.body)
+                        : '[disabled]',
+            },
+        };
+
+        await mkdir(logDir, { recursive: true });
+        await appendFile(
+            filePath,
+            `${JSON.stringify(record)}\n`,
+            'utf8'
+        );
+
+        console.warn('[MISSING PHONE] saved diagnostic case', {
+            failureReason,
+            flow,
+            messageId: env?.id || null,
+            filePath,
+        });
+    } catch (error) {
+        // Audit heç vaxt əsas bridge axınını dayandırmamalıdır.
+        console.error('[MISSING PHONE] audit write failed', {
+            message: error?.message || String(error),
+        });
     }
 }
 
@@ -303,9 +476,25 @@ const EVOLUTION_LID_PHONE_MISS_CACHE_MS = 60 * 1000;
 async function resolvePhoneFromLid(
     instanceName,
     lidJid,
-    selfPhone = ''
+    selfPhone = '',
+    diagnostic = null
 ) {
     const normalizedLid = String(lidJid || '').trim();
+
+    const setDiagnostic = (values) => {
+        if (diagnostic && typeof diagnostic === 'object') {
+            Object.assign(diagnostic, sanitizeDiagnosticValue(values));
+        }
+    };
+
+    setDiagnostic({
+        attempted: true,
+        instanceName,
+        lidJid: normalizedLid || null,
+        cacheHit: false,
+        requestFailed: false,
+        resolvedPhone: null,
+    });
 
     if (
         !instanceName ||
@@ -313,6 +502,9 @@ async function resolvePhoneFromLid(
         !EVOLUTION_API_BASE ||
         !EVOLUTION_API_KEY
     ) {
+        setDiagnostic({
+            failureReason: 'lid_lookup_invalid_configuration_or_jid',
+        });
         return null;
     }
 
@@ -320,6 +512,12 @@ async function resolvePhoneFromLid(
     const cached = evolutionLidPhoneCache.get(cacheKey);
 
     if (cached && cached.expiresAt > Date.now()) {
+        setDiagnostic({
+            ...(cached.diagnostic || {}),
+            cacheHit: true,
+            cachedAt: cached.cachedAt || null,
+            resolvedPhone: cached.phone || null,
+        });
         return cached.phone;
     }
 
@@ -406,8 +604,65 @@ async function resolvePhoneFromLid(
             }
         }
 
+        const contactsError =
+            contactsResult.status === 'rejected'
+                ? {
+                    status: contactsResult.reason?.response?.status || null,
+                    data: contactsResult.reason?.response?.data || null,
+                    message: contactsResult.reason?.message || String(contactsResult.reason),
+                }
+                : null;
+
+        const chatsError =
+            chatsResult.status === 'rejected'
+                ? {
+                    status: chatsResult.reason?.response?.status || null,
+                    data: chatsResult.reason?.response?.data || null,
+                    message: chatsResult.reason?.message || String(chatsResult.reason),
+                }
+                : null;
+
+        const requestFailed = !!contactsError || !!chatsError;
+        let failureReason = null;
+
+        if (!resolvedPhone) {
+            if (requestFailed && contacts.length === 0 && chats.length === 0) {
+                failureReason = 'lid_lookup_request_failed';
+            } else if (matchingItems.length === 0) {
+                failureReason = 'lid_lookup_no_matching_contact_or_chat';
+            } else {
+                failureReason = 'lid_lookup_match_without_phone_fields';
+            }
+        }
+
+        const lookupDiagnostic = {
+            attempted: true,
+            instanceName,
+            lidJid: normalizedLid,
+            query,
+            cacheHit: false,
+            requestFailed,
+            contactsStatus: contactsResult.status,
+            chatsStatus: chatsResult.status,
+            contactsError,
+            chatsError,
+            contactsCount: contacts.length,
+            chatsCount: chats.length,
+            matchingItemsCount: matchingItems.length,
+            matchingItems,
+            // Nadir format fərqini görmək üçün limitli raw sample saxlanılır.
+            contactsSample: contacts.slice(0, 25),
+            chatsSample: chats.slice(0, 25),
+            resolvedPhone,
+            failureReason,
+        };
+
+        setDiagnostic(lookupDiagnostic);
+
         evolutionLidPhoneCache.set(cacheKey, {
             phone: resolvedPhone,
+            diagnostic: sanitizeDiagnosticValue(lookupDiagnostic),
+            cachedAt: new Date().toISOString(),
             expiresAt:
                 Date.now() +
                 (
@@ -420,16 +675,37 @@ async function resolvePhoneFromLid(
         console.log('[PHONE RESOLVE] LID lookup', {
             instanceName,
             lidJid: normalizedLid,
+            contactsStatus: contactsResult.status,
+            chatsStatus: chatsResult.status,
             contactsCount: contacts.length,
             chatsCount: chats.length,
+            matchingItemsCount: matchingItems.length,
             resolvedPhone:
                 resolvedPhone
                     ? `+${resolvedPhone}`
                     : null,
+            failureReason,
         });
 
         return resolvedPhone;
     } catch (error) {
+        const errorDiagnostic = {
+            attempted: true,
+            instanceName,
+            lidJid: normalizedLid,
+            cacheHit: false,
+            requestFailed: true,
+            failureReason: 'lid_lookup_exception',
+            error: {
+                status: error?.response?.status || null,
+                data: error?.response?.data || null,
+                message: error?.message || String(error),
+            },
+            resolvedPhone: null,
+        };
+
+        setDiagnostic(errorDiagnostic);
+
         console.error(
             '[PHONE RESOLVE] LID lookup failed:',
             error?.response?.status,
@@ -438,6 +714,8 @@ async function resolvePhoneFromLid(
 
         evolutionLidPhoneCache.set(cacheKey, {
             phone: null,
+            diagnostic: sanitizeDiagnosticValue(errorDiagnostic),
+            cachedAt: new Date().toISOString(),
             expiresAt:
                 Date.now() +
                 EVOLUTION_LID_PHONE_MISS_CACHE_MS,
@@ -1220,6 +1498,8 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             '';
 
         let phone = null;
+        const lidDiagnostic = {};
+        let selfPhoneRejected = false;
 
         for (const senderJid of senderJidCandidates) {
             const candidatePhone =
@@ -1250,7 +1530,8 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 phone = await resolvePhoneFromLid(
                     instanceName,
                     lidJid,
-                    instanceSelfPhone
+                    instanceSelfPhone,
+                    lidDiagnostic
                 );
             }
         }
@@ -1273,6 +1554,7 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 }
             );
 
+            selfPhoneRejected = true;
             phone = null;
         }
 
@@ -1291,6 +1573,29 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     ? `+${phone}`
                     : null,
         });
+
+
+        const publishOutgoingChat = async (
+            destination,
+            payloadObj,
+            flow
+        ) => {
+            if (!normalizePhoneDigits(payloadObj?.phone)) {
+                await persistMissingPhoneCase({
+                    req,
+                    env,
+                    instanceName,
+                    senderJidCandidates,
+                    instanceSelfPhone,
+                    lidDiagnostic,
+                    selfPhoneRejected,
+                    outboundPayload: payloadObj,
+                    flow,
+                });
+            }
+
+            publishStomp(destination, payloadObj);
+        };
 
         // ✅ Bloklanmış nömrə -> tam skip, newChat-a getmir
         if (phone && BLOCKED_PHONES_SET.has(phone)) {
@@ -1436,9 +1741,10 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     locationLng: locationReplyChat.locationLng,
                 });
 
-                publishStomp(
+                await publishOutgoingChat(
                     '/app/sendChatMessage',
-                    locationReplyChat
+                    locationReplyChat,
+                    'reply_location'
                 );
 
                 // Reply yeni sifariş deyil: statistika və push yoxdur.
@@ -1477,9 +1783,10 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 replyMessage: textReplyChat.replyMessage,
             });
 
-            publishStomp(
+            await publishOutgoingChat(
                 '/app/sendChatMessage',
-                textReplyChat
+                textReplyChat,
+                'reply_text'
             );
 
             // Reply yeni sifariş deyil: statistika və push yoxdur.
@@ -1572,7 +1879,11 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     locationLng: newChat.locationLng,
                 });
 
-                publishStomp('/app/sendChatMessage', newChat);
+                await publishOutgoingChat(
+                    '/app/sendChatMessage',
+                    newChat,
+                    'order_location'
+                );
 
                 await incrementTodayGroupCount(
                     instanceName,
@@ -1657,7 +1968,11 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 thumbnail: "",
             };
 
-            publishStomp('/app/sendChatMessage', newChat);
+            await publishOutgoingChat(
+                '/app/sendChatMessage',
+                newChat,
+                'order_text'
+            );
 
             await incrementTodayGroupCount(
                 instanceName,
