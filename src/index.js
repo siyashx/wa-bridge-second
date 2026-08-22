@@ -222,26 +222,16 @@ function getMissingPhoneFailureReason({
     const hasSnet = senderJidCandidates.some(value => /@s\.whatsapp\.net$/.test(value));
 
     if (hasLid) {
+        // LID resolver contacts/chats + group participants mərhələlərini özü diaqnostika edir.
+        if (lidDiagnostic?.failureReason) {
+            return lidDiagnostic.failureReason;
+        }
+
         if (lidDiagnostic?.cacheHit && !lidDiagnostic?.resolvedPhone) {
-            return lidDiagnostic?.failureReason || 'lid_lookup_cached_miss';
+            return 'lid_lookup_cached_miss';
         }
 
-        if (lidDiagnostic?.requestFailed) {
-            return 'lid_lookup_request_failed';
-        }
-
-        if (lidDiagnostic?.matchingItemsCount === 0) {
-            return 'lid_lookup_no_matching_contact_or_chat';
-        }
-
-        if (
-            Number(lidDiagnostic?.matchingItemsCount || 0) > 0 &&
-            !lidDiagnostic?.resolvedPhone
-        ) {
-            return 'lid_lookup_match_without_phone_fields';
-        }
-
-        return lidDiagnostic?.failureReason || 'lid_lookup_unresolved';
+        return 'lid_lookup_unresolved';
     }
 
     if (hasSnet) {
@@ -257,6 +247,7 @@ async function persistMissingPhoneCase({
     instanceName,
     senderJidCandidates,
     instanceSelfPhone,
+    webhookOwnerPhone,
     lidDiagnostic,
     selfPhoneRejected,
     outboundPayload,
@@ -292,6 +283,9 @@ async function persistMissingPhoneCase({
             senderJidCandidates,
             instanceSelfPhone: instanceSelfPhone
                 ? `+${instanceSelfPhone}`
+                : null,
+            webhookOwnerPhone: webhookOwnerPhone
+                ? `+${webhookOwnerPhone}`
                 : null,
             selfPhoneRejected: !!selfPhoneRejected,
             lidDiagnostic: sanitizeDiagnosticValue(lidDiagnostic),
@@ -389,6 +383,36 @@ const INSTANCE_SELF_PHONES = new Map(
     ].filter(([instanceName, phone]) => instanceName && phone)
 );
 
+/*
+ * Bütün qoşulmuş Evolution nömrələri qlobal reject siyahısındadır.
+ * Instance -> phone .env mapping-i köhnə/səhv olsa belə, bridge həmin nömrəni
+ * sifarişçinin phone sahəsinə yazmamalıdır.
+ */
+const ALL_INSTANCE_SELF_PHONES = new Set(
+    [...INSTANCE_SELF_PHONES.values()].filter(Boolean)
+);
+
+function getWebhookOwnerPhone(reqBody) {
+    /*
+     * Evolution webhook envelope-də top-level `sender` instance-ın öz WUID-sidir.
+     * Bu sahə HEÇ VAXT mesaj müəllifi kimi istifadə olunmur; yalnız reject üçündür.
+     */
+    return parsePhoneFromSNetJid(reqBody?.sender) || '';
+}
+
+function buildRejectedInstancePhones(
+    instanceSelfPhone = '',
+    webhookOwnerPhone = ''
+) {
+    return new Set(
+        [
+            ...ALL_INSTANCE_SELF_PHONES,
+            normalizePhoneDigits(instanceSelfPhone),
+            normalizePhoneDigits(webhookOwnerPhone),
+        ].filter(Boolean)
+    );
+}
+
 function getDirectSenderJidCandidates(reqBody, env) {
     const candidates = [
         env?.participantAlt,
@@ -399,27 +423,33 @@ function getDirectSenderJidCandidates(reqBody, env) {
         env?.raw?.participant,
         reqBody?.data?.key?.participantAlt,
         reqBody?.data?.key?.participant,
+        reqBody?.data?.key?.participantLid,
+        reqBody?.data?.key?.senderLid,
 
-        /*
-         * Evolution API v2.3.7 + LID addressing hallarında key.participant
-         * yalnız <id>@lid ola bilər, amma webhook envelope-də real PN ayrıca
-         * sender / senderPn kimi @s.whatsapp.net JID ilə gələ bilir.
-         * Bunları yalnız candidate kimi əlavə edirik; aşağıdakı resolver onsuz da
-         * yalnız @s.whatsapp.net formatını qəbul edir və instanceSelfPhone-u rədd edir.
-         */
+        // PN adlı sahələr mesaj müəllifinin phone-number JID-si ola bilər.
         reqBody?.data?.key?.senderPn,
         reqBody?.data?.senderPn,
-        reqBody?.data?.sender,
 
         reqBody?.data?.participantAlt,
         reqBody?.data?.participant,
+        reqBody?.data?.participantLid,
         reqBody?.key?.participantAlt,
         reqBody?.key?.participant,
+        reqBody?.key?.participantLid,
+        reqBody?.key?.senderLid,
         reqBody?.key?.senderPn,
         reqBody?.participantAlt,
         reqBody?.participant,
+        reqBody?.participantLid,
+        reqBody?.senderLid,
         reqBody?.senderPn,
-        reqBody?.sender,
+
+        /*
+         * QƏSDƏN YOXDUR:
+         *   reqBody.sender / reqBody.data.sender
+         * Evolution webhook top-level sender instance-a qoşulmuş WhatsApp hesabıdır,
+         * qrup mesajının müəllifi deyil.
+         */
     ];
 
     return [
@@ -433,12 +463,23 @@ function getDirectSenderJidCandidates(reqBody, env) {
 
 function extractPhoneFromSpecificEvolutionItem(
     item,
-    selfPhone,
+    rejectedPhones,
     lidDigits
 ) {
     if (!item || typeof item !== 'object') {
         return null;
     }
+
+    const rejectSet =
+        rejectedPhones instanceof Set
+            ? rejectedPhones
+            : new Set();
+
+    const isAllowedPhone = (phone) => (
+        /^\d{8,15}$/.test(String(phone || '')) &&
+        !rejectSet.has(String(phone)) &&
+        String(phone) !== String(lidDigits || '')
+    );
 
     /*
      * Yalnız telefon nömrəsini ifadə edə bilən konkret sahələrə baxırıq.
@@ -450,16 +491,13 @@ function extractPhoneFromSpecificEvolutionItem(
         item.jidAlt,
         item.pn,
         item.phoneJid,
+        item.phoneNumber,
     ];
 
     for (const value of jidCandidates) {
         const phone = parsePhoneFromSNetJid(value);
 
-        if (
-            phone &&
-            phone !== selfPhone &&
-            phone !== lidDigits
-        ) {
+        if (phone && isAllowedPhone(phone)) {
             return phone;
         }
     }
@@ -472,11 +510,7 @@ function extractPhoneFromSpecificEvolutionItem(
     for (const value of digitCandidates) {
         const phone = normalizePhoneDigits(value);
 
-        if (
-            /^\d{8,15}$/.test(phone) &&
-            phone !== selfPhone &&
-            phone !== lidDigits
-        ) {
+        if (isAllowedPhone(phone)) {
             return phone;
         }
     }
@@ -491,10 +525,16 @@ const EVOLUTION_LID_PHONE_MISS_CACHE_MS = 60 * 1000;
 async function resolvePhoneFromLid(
     instanceName,
     lidJid,
-    selfPhone = '',
-    diagnostic = null
+    rejectedPhones = new Set(),
+    diagnostic = null,
+    groupJid = null
 ) {
     const normalizedLid = String(lidJid || '').trim();
+    const normalizedGroupJid = String(groupJid || '').trim();
+    const rejectSet =
+        rejectedPhones instanceof Set
+            ? rejectedPhones
+            : new Set();
 
     const setDiagnostic = (values) => {
         if (diagnostic && typeof diagnostic === 'object') {
@@ -506,6 +546,7 @@ async function resolvePhoneFromLid(
         attempted: true,
         instanceName,
         lidJid: normalizedLid || null,
+        groupJid: normalizedGroupJid || null,
         cacheHit: false,
         requestFailed: false,
         resolvedPhone: null,
@@ -527,13 +568,20 @@ async function resolvePhoneFromLid(
     const cached = evolutionLidPhoneCache.get(cacheKey);
 
     if (cached && cached.expiresAt > Date.now()) {
-        setDiagnostic({
-            ...(cached.diagnostic || {}),
-            cacheHit: true,
-            cachedAt: cached.cachedAt || null,
-            resolvedPhone: cached.phone || null,
-        });
-        return cached.phone;
+        const cachedPhone = String(cached.phone || '');
+
+        // Sonradan owner/reject siyahısı dəyişibsə köhnə təhlükəli cache-i işlətmirik.
+        if (!cachedPhone || !rejectSet.has(cachedPhone)) {
+            setDiagnostic({
+                ...(cached.diagnostic || {}),
+                cacheHit: true,
+                cachedAt: cached.cachedAt || null,
+                resolvedPhone: cachedPhone || null,
+            });
+            return cachedPhone || null;
+        }
+
+        evolutionLidPhoneCache.delete(cacheKey);
     }
 
     const urlBase = String(EVOLUTION_API_BASE)
@@ -552,6 +600,12 @@ async function resolvePhoneFromLid(
             remoteJid: normalizedLid,
         },
     };
+
+    const toErrorDiagnostic = (error) => ({
+        status: error?.response?.status || null,
+        data: error?.response?.data || null,
+        message: error?.message || String(error),
+    });
 
     try {
         const [contactsResult, chatsResult] =
@@ -585,32 +639,31 @@ async function resolvePhoneFromLid(
         const allItems = [...contacts, ...chats];
         const lidDigits = parseDigitsFromLid(normalizedLid);
 
-        const matchingItems = allItems.filter((item) => {
+        const matchesLid = (item) => {
             const ids = [
                 item?.remoteJid,
                 item?.jid,
                 item?.id,
                 item?.lid,
+                item?.participant,
+                item?.participantLid,
+                item?.senderLid,
             ]
                 .map(value => String(value || '').trim())
                 .filter(Boolean);
 
             return ids.includes(normalizedLid);
-        });
+        };
 
-        /*
-         * Endpoint filteri işləməsə və bütün kontaktları qaytarsa,
-         * əlaqəsiz ilk kontaktın nömrəsini götürmürük.
-         */
-        const orderedItems = matchingItems;
+        const matchingItems = allItems.filter(matchesLid);
 
         let resolvedPhone = null;
 
-        for (const item of orderedItems) {
+        for (const item of matchingItems) {
             resolvedPhone =
                 extractPhoneFromSpecificEvolutionItem(
                     item,
-                    selfPhone,
+                    rejectSet,
                     lidDigits
                 );
 
@@ -621,32 +674,93 @@ async function resolvePhoneFromLid(
 
         const contactsError =
             contactsResult.status === 'rejected'
-                ? {
-                    status: contactsResult.reason?.response?.status || null,
-                    data: contactsResult.reason?.response?.data || null,
-                    message: contactsResult.reason?.message || String(contactsResult.reason),
-                }
+                ? toErrorDiagnostic(contactsResult.reason)
                 : null;
 
         const chatsError =
             chatsResult.status === 'rejected'
-                ? {
-                    status: chatsResult.reason?.response?.status || null,
-                    data: chatsResult.reason?.response?.data || null,
-                    message: chatsResult.reason?.message || String(chatsResult.reason),
-                }
+                ? toErrorDiagnostic(chatsResult.reason)
                 : null;
 
-        const requestFailed = !!contactsError || !!chatsError;
+        /*
+         * Evolution 2.3.x qrup participant metadata-sında LID ilə yanaşı
+         * phoneNumber saxlaya bilir. Contacts/chats mapping-i yetməsə, qrupun
+         * participant siyahısından konkret LID üzvünü tapırıq.
+         */
+        let groupParticipantsStatus = 'not_attempted';
+        let groupParticipantsError = null;
+        let groupParticipants = [];
+        let groupMatchingItems = [];
+
+        if (
+            !resolvedPhone &&
+            /@g\.us$/.test(normalizedGroupJid)
+        ) {
+            try {
+                const groupResult = await axios.get(
+                    `${urlBase}/group/participants/${encodeURIComponent(instanceName)}`,
+                    {
+                        ...requestConfig,
+                        params: {
+                            groupJid: normalizedGroupJid,
+                        },
+                    }
+                );
+
+                groupParticipantsStatus = 'fulfilled';
+                groupParticipants =
+                    Array.isArray(groupResult?.data?.participants)
+                        ? groupResult.data.participants
+                        : normalizeEvolutionResultList(groupResult?.data);
+                groupMatchingItems = groupParticipants.filter(matchesLid);
+
+                for (const item of groupMatchingItems) {
+                    resolvedPhone =
+                        extractPhoneFromSpecificEvolutionItem(
+                            item,
+                            rejectSet,
+                            lidDigits
+                        );
+
+                    if (resolvedPhone) {
+                        break;
+                    }
+                }
+            } catch (error) {
+                groupParticipantsStatus = 'rejected';
+                groupParticipantsError = toErrorDiagnostic(error);
+            }
+        }
+
+        const requestFailed =
+            !!contactsError ||
+            !!chatsError ||
+            groupParticipantsStatus === 'rejected';
+
         let failureReason = null;
 
         if (!resolvedPhone) {
-            if (requestFailed && contacts.length === 0 && chats.length === 0) {
+            if (groupMatchingItems.length > 0) {
+                failureReason =
+                    'lid_group_participant_match_without_phone_fields';
+            } else if (matchingItems.length > 0) {
+                failureReason =
+                    'lid_lookup_match_without_phone_fields';
+            } else if (
+                groupParticipantsStatus === 'rejected' &&
+                contacts.length === 0 &&
+                chats.length === 0
+            ) {
+                failureReason =
+                    'lid_group_participants_request_failed';
+            } else if (
+                contactsError &&
+                chatsError &&
+                groupParticipantsStatus === 'not_attempted'
+            ) {
                 failureReason = 'lid_lookup_request_failed';
-            } else if (matchingItems.length === 0) {
-                failureReason = 'lid_lookup_no_matching_contact_or_chat';
             } else {
-                failureReason = 'lid_lookup_match_without_phone_fields';
+                failureReason = 'lid_lookup_no_mapping';
             }
         }
 
@@ -654,6 +768,7 @@ async function resolvePhoneFromLid(
             attempted: true,
             instanceName,
             lidJid: normalizedLid,
+            groupJid: normalizedGroupJid || null,
             query,
             cacheHit: false,
             requestFailed,
@@ -665,9 +780,14 @@ async function resolvePhoneFromLid(
             chatsCount: chats.length,
             matchingItemsCount: matchingItems.length,
             matchingItems,
-            // Nadir format fərqini görmək üçün limitli raw sample saxlanılır.
             contactsSample: contacts.slice(0, 25),
             chatsSample: chats.slice(0, 25),
+            groupParticipantsStatus,
+            groupParticipantsError,
+            groupParticipantsCount: groupParticipants.length,
+            groupMatchingItemsCount: groupMatchingItems.length,
+            groupMatchingItems,
+            groupParticipantsSample: groupParticipants.slice(0, 50),
             resolvedPhone,
             failureReason,
         };
@@ -690,11 +810,15 @@ async function resolvePhoneFromLid(
         console.log('[PHONE RESOLVE] LID lookup', {
             instanceName,
             lidJid: normalizedLid,
+            groupJid: normalizedGroupJid || null,
             contactsStatus: contactsResult.status,
             chatsStatus: chatsResult.status,
             contactsCount: contacts.length,
             chatsCount: chats.length,
             matchingItemsCount: matchingItems.length,
+            groupParticipantsStatus,
+            groupParticipantsCount: groupParticipants.length,
+            groupMatchingItemsCount: groupMatchingItems.length,
             resolvedPhone:
                 resolvedPhone
                     ? `+${resolvedPhone}`
@@ -708,14 +832,11 @@ async function resolvePhoneFromLid(
             attempted: true,
             instanceName,
             lidJid: normalizedLid,
+            groupJid: normalizedGroupJid || null,
             cacheHit: false,
             requestFailed: true,
             failureReason: 'lid_lookup_exception',
-            error: {
-                status: error?.response?.status || null,
-                data: error?.response?.data || null,
-                message: error?.message || String(error),
-            },
+            error: toErrorDiagnostic(error),
             resolvedPhone: null,
         };
 
@@ -776,6 +897,7 @@ function normalizeEvolutionResultList(payload) {
     const candidates = [
         payload?.contacts,
         payload?.chats,
+        payload?.participants,
         payload?.data,
         payload?.records,
         payload?.result,
@@ -1512,6 +1634,18 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             INSTANCE_SELF_PHONES.get(instanceName) ||
             '';
 
+        /*
+         * Evolution webhook top-level sender = instance owner WUID.
+         * Onu customer phone kimi qəbul etmirik; əksinə reject siyahısına salırıq.
+         */
+        const webhookOwnerPhone =
+            getWebhookOwnerPhone(req.body);
+        const rejectedInstancePhones =
+            buildRejectedInstancePhones(
+                instanceSelfPhone,
+                webhookOwnerPhone
+            );
+
         let phone = null;
         const lidDiagnostic = {};
         let selfPhoneRejected = false;
@@ -1522,16 +1656,24 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
 
             if (
                 candidatePhone &&
-                candidatePhone !== instanceSelfPhone
+                !rejectedInstancePhones.has(candidatePhone)
             ) {
                 phone = candidatePhone;
                 break;
+            }
+
+            if (
+                candidatePhone &&
+                rejectedInstancePhones.has(candidatePhone)
+            ) {
+                selfPhoneRejected = true;
             }
         }
 
         /*
          * participant yalnız @lid-dirsə, LID rəqəmlərini telefon kimi yazmırıq.
-         * Evolution contacts/chats məlumatından remoteJidAlt/phoneNumber tapmağa çalışırıq.
+         * Əvvəl contacts/chats, sonra qrup participant metadata-sındakı phoneNumber
+         * ilə LID -> real telefon mapping-i axtarılır.
          */
         if (!phone) {
             const lidJid =
@@ -1545,23 +1687,23 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 phone = await resolvePhoneFromLid(
                     instanceName,
                     lidJid,
-                    instanceSelfPhone,
-                    lidDiagnostic
+                    rejectedInstancePhones,
+                    lidDiagnostic,
+                    env?.remoteJid || null
                 );
             }
         }
 
         /*
-         * Son təhlükəsizlik qatı: hansı səbəbdənsə öz nömrəmiz çıxarsa,
-         * onu saxlamırıq. Nömrə tapılmayanda phone boş qalacaq.
+         * Son təhlükəsizlik qatı: hansı mənbədən gəlməsindən asılı olmayaraq
+         * qoşulmuş Evolution nömrələrindən biri çıxarsa customer phone kimi saxlamırıq.
          */
         if (
             phone &&
-            instanceSelfPhone &&
-            phone === instanceSelfPhone
+            rejectedInstancePhones.has(phone)
         ) {
             console.error(
-                '[PHONE RESOLVE] self phone rejected',
+                '[PHONE RESOLVE] instance phone rejected',
                 {
                     instanceName,
                     phone: `+${phone}`,
@@ -1579,9 +1721,13 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
             participantAlt:
                 env?.participantAlt || null,
             senderJidCandidates,
-            selfPhone:
+            configuredSelfPhone:
                 instanceSelfPhone
                     ? `+${instanceSelfPhone}`
+                    : null,
+            webhookOwnerPhone:
+                webhookOwnerPhone
+                    ? `+${webhookOwnerPhone}`
                     : null,
             resolvedPhone:
                 phone
@@ -1602,6 +1748,7 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                     instanceName,
                     senderJidCandidates,
                     instanceSelfPhone,
+                    webhookOwnerPhone,
                     lidDiagnostic,
                     selfPhoneRejected,
                     outboundPayload: payloadObj,
