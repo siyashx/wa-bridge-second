@@ -399,12 +399,27 @@ function getDirectSenderJidCandidates(reqBody, env) {
         env?.raw?.participant,
         reqBody?.data?.key?.participantAlt,
         reqBody?.data?.key?.participant,
+
+        /*
+         * Evolution API v2.3.7 + LID addressing hallarında key.participant
+         * yalnız <id>@lid ola bilər, amma webhook envelope-də real PN ayrıca
+         * sender / senderPn kimi @s.whatsapp.net JID ilə gələ bilir.
+         * Bunları yalnız candidate kimi əlavə edirik; aşağıdakı resolver onsuz da
+         * yalnız @s.whatsapp.net formatını qəbul edir və instanceSelfPhone-u rədd edir.
+         */
+        reqBody?.data?.key?.senderPn,
+        reqBody?.data?.senderPn,
+        reqBody?.data?.sender,
+
         reqBody?.data?.participantAlt,
         reqBody?.data?.participant,
         reqBody?.key?.participantAlt,
         reqBody?.key?.participant,
+        reqBody?.key?.senderPn,
         reqBody?.participantAlt,
         reqBody?.participant,
+        reqBody?.senderPn,
+        reqBody?.sender,
     ];
 
     return [
