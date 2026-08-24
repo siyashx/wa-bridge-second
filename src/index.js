@@ -4,7 +4,7 @@ import express from 'express';
 import axios from 'axios';
 import { Client } from '@stomp/stompjs';
 import WebSocket from 'ws';
-import { mkdir, appendFile } from 'node:fs/promises';
+import { mkdir, appendFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const app = express();
@@ -23,6 +23,8 @@ const {
     MISSING_PHONE_AUDIT = '1',
     MISSING_PHONE_LOG_DIR = './logs/missing-phone',
     MISSING_PHONE_SAVE_RAW = '1',
+    LID_PHONE_MAP_ENABLED = '1',
+    LID_PHONE_MAP_FILE = './data/lid-phone-map.jsonl',
 } = process.env;
 
 const MOTO_TAKSI_ORDER_GROUP_JID = String(
@@ -492,6 +494,29 @@ function extractPhoneFromSpecificEvolutionItem(
         item.pn,
         item.phoneJid,
         item.phoneNumber,
+
+        /*
+         * Evolution findChats/findContacts bəzən PN mapping-i obyektin
+         * özündə yox, onun lastMessage.key hissəsində saxlayır.
+         * Məsələn:
+         *   remoteJid:    30533526544389@lid
+         *   remoteJidAlt: 994702001174@s.whatsapp.net
+         *
+         * Köhnə resolver bu sahələri oxumadığı üçün real nömrə API
+         * cavabında olsa belə phone boş qalırdı.
+         */
+        item.key?.remoteJidAlt,
+        item.key?.participantAlt,
+        item.key?.senderPn,
+        item.key?.participantPn,
+        item.lastMessage?.key?.remoteJidAlt,
+        item.lastMessage?.key?.participantAlt,
+        item.lastMessage?.key?.senderPn,
+        item.lastMessage?.key?.participantPn,
+        item.lastMessage?.remoteJidAlt,
+        item.lastMessage?.participantAlt,
+        item.lastMessage?.senderPn,
+        item.lastMessage?.participantPn,
     ];
 
     for (const value of jidCandidates) {
@@ -516,6 +541,269 @@ function extractPhoneFromSpecificEvolutionItem(
     }
 
     return null;
+}
+
+/* ---------------- persistent LID -> phone mapping ---------------- */
+
+/*
+ * WhatsApp LID -> PN mapping həmişə eyni webhook-da gəlmir. Mapping bir dəfə
+ * göründükdən sonra restart zamanı itməsin deyə diskdə saxlayırıq. Bu map hər
+ * iki Evolution instance üçün ortaqdır; LID WhatsApp istifadəçisinə aiddir.
+ */
+const persistentLidPhoneMap = new Map();
+let persistentLidPhoneMapLoadPromise = null;
+let persistentLidPhoneMapWriteChain = Promise.resolve();
+
+function isSafeLidPhonePair(lidJid, phone, rejectedPhones = new Set()) {
+    const normalizedLid = String(lidJid || '').trim();
+    const normalizedPhone = normalizePhoneDigits(phone);
+    const rejectSet =
+        rejectedPhones instanceof Set
+            ? rejectedPhones
+            : new Set();
+
+    return (
+        /^\d+@lid$/.test(normalizedLid) &&
+        /^\d{8,15}$/.test(normalizedPhone) &&
+        normalizedPhone !== parseDigitsFromLid(normalizedLid) &&
+        !ALL_INSTANCE_SELF_PHONES.has(normalizedPhone) &&
+        !rejectSet.has(normalizedPhone)
+    );
+}
+
+async function ensurePersistentLidPhoneMapLoaded() {
+    if (String(LID_PHONE_MAP_ENABLED) !== '1') return;
+
+    if (!persistentLidPhoneMapLoadPromise) {
+        persistentLidPhoneMapLoadPromise = (async () => {
+            const filePath = path.resolve(
+                process.cwd(),
+                LID_PHONE_MAP_FILE
+            );
+
+            try {
+                const raw = await readFile(filePath, 'utf8');
+                let loaded = 0;
+
+                for (const line of raw.split(/\r?\n/)) {
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+
+                    try {
+                        const record = JSON.parse(trimmed);
+                        const lidJid = String(record?.lidJid || '').trim();
+                        const phone = normalizePhoneDigits(record?.phone);
+
+                        if (!isSafeLidPhonePair(lidJid, phone)) {
+                            continue;
+                        }
+
+                        const existing = persistentLidPhoneMap.get(lidJid);
+
+                        // Conflict olduqda köhnə etibarlı mapping-i avtomatik dəyişmirik.
+                        if (existing && existing !== phone) {
+                            console.error('[LID MAP] persisted conflict ignored', {
+                                lidJid,
+                                existingPhone: `+${existing}`,
+                                conflictingPhone: `+${phone}`,
+                            });
+                            continue;
+                        }
+
+                        if (!existing) loaded += 1;
+                        persistentLidPhoneMap.set(lidJid, phone);
+                    } catch {
+                        // Bir korlanmış sətir bütün map-i sıradan çıxarmasın.
+                    }
+                }
+
+                console.log('[LID MAP] persistent map loaded', {
+                    filePath,
+                    entries: persistentLidPhoneMap.size,
+                    loaded,
+                });
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    console.error('[LID MAP] persistent map load failed', {
+                        message: error?.message || String(error),
+                    });
+                }
+            }
+        })();
+    }
+
+    await persistentLidPhoneMapLoadPromise;
+}
+
+function queuePersistentLidPhoneRecords(records) {
+    if (
+        String(LID_PHONE_MAP_ENABLED) !== '1' ||
+        !Array.isArray(records) ||
+        records.length === 0
+    ) {
+        return Promise.resolve();
+    }
+
+    const filePath = path.resolve(
+        process.cwd(),
+        LID_PHONE_MAP_FILE
+    );
+    const payload = records
+        .map(record => JSON.stringify(record))
+        .join('\n') + '\n';
+
+    persistentLidPhoneMapWriteChain =
+        persistentLidPhoneMapWriteChain
+            .then(async () => {
+                await mkdir(path.dirname(filePath), {
+                    recursive: true,
+                    mode: 0o700,
+                });
+                await appendFile(
+                    filePath,
+                    payload,
+                    {
+                        encoding: 'utf8',
+                        mode: 0o600,
+                    }
+                );
+            })
+            .catch(error => {
+                console.error('[LID MAP] persistent map write failed', {
+                    message: error?.message || String(error),
+                });
+            });
+
+    return persistentLidPhoneMapWriteChain;
+}
+
+async function rememberLidPhonePairs(
+    pairs,
+    rejectedPhones = new Set(),
+    source = 'unknown'
+) {
+    if (String(LID_PHONE_MAP_ENABLED) !== '1') return 0;
+
+    await ensurePersistentLidPhoneMapLoaded();
+
+    const records = [];
+    const now = new Date().toISOString();
+
+    for (const pair of Array.isArray(pairs) ? pairs : []) {
+        const lidJid = String(pair?.lidJid || '').trim();
+        const phone = normalizePhoneDigits(pair?.phone);
+
+        if (!isSafeLidPhonePair(lidJid, phone, rejectedPhones)) {
+            continue;
+        }
+
+        const existing = persistentLidPhoneMap.get(lidJid);
+
+        if (existing === phone) {
+            continue;
+        }
+
+        if (existing && existing !== phone) {
+            console.error('[LID MAP] live mapping conflict ignored', {
+                lidJid,
+                existingPhone: `+${existing}`,
+                conflictingPhone: `+${phone}`,
+                source,
+            });
+            continue;
+        }
+
+        persistentLidPhoneMap.set(lidJid, phone);
+        records.push({
+            schemaVersion: 1,
+            type: 'lid_phone_mapping',
+            updatedAt: now,
+            lidJid,
+            phone,
+            source,
+        });
+    }
+
+    if (records.length > 0) {
+        await queuePersistentLidPhoneRecords(records);
+        console.log('[LID MAP] learned mappings', {
+            source,
+            count: records.length,
+        });
+    }
+
+    return records.length;
+}
+
+function getLidJidFromEvolutionItem(item) {
+    if (!item || typeof item !== 'object') return null;
+
+    const candidates = [
+        item.remoteJid,
+        item.jid,
+        item.id,
+        item.lid,
+        item.participant,
+        item.participantLid,
+        item.senderLid,
+        item.key?.remoteJid,
+        item.key?.participant,
+        item.lastMessage?.key?.remoteJid,
+        item.lastMessage?.key?.participant,
+    ];
+
+    return (
+        candidates
+            .map(value => String(value || '').trim())
+            .find(value => /^\d+@lid$/.test(value)) ||
+        null
+    );
+}
+
+async function learnLidPhoneMappingsFromEvolutionItems(
+    items,
+    rejectedPhones = new Set(),
+    source = 'evolution_api'
+) {
+    const pairs = [];
+
+    for (const item of Array.isArray(items) ? items : []) {
+        const lidJid = getLidJidFromEvolutionItem(item);
+        if (!lidJid) continue;
+
+        const phone = extractPhoneFromSpecificEvolutionItem(
+            item,
+            rejectedPhones,
+            parseDigitsFromLid(lidJid)
+        );
+
+        if (phone) {
+            pairs.push({ lidJid, phone });
+        }
+    }
+
+    return rememberLidPhonePairs(
+        pairs,
+        rejectedPhones,
+        source
+    );
+}
+
+async function getPersistentPhoneForLid(
+    lidJid,
+    rejectedPhones = new Set()
+) {
+    if (String(LID_PHONE_MAP_ENABLED) !== '1') return null;
+
+    await ensurePersistentLidPhoneMapLoaded();
+
+    const phone = persistentLidPhoneMap.get(
+        String(lidJid || '').trim()
+    );
+
+    return isSafeLidPhonePair(lidJid, phone, rejectedPhones)
+        ? phone
+        : null;
 }
 
 const evolutionLidPhoneCache = new Map();
@@ -562,6 +850,20 @@ async function resolvePhoneFromLid(
             failureReason: 'lid_lookup_invalid_configuration_or_jid',
         });
         return null;
+    }
+
+    const persistentPhone = await getPersistentPhoneForLid(
+        normalizedLid,
+        rejectSet
+    );
+
+    if (persistentPhone) {
+        setDiagnostic({
+            cacheHit: true,
+            cacheSource: 'persistent_lid_phone_map',
+            resolvedPhone: persistentPhone,
+        });
+        return persistentPhone;
     }
 
     const cacheKey = `${instanceName}:${normalizedLid}`;
@@ -639,6 +941,17 @@ async function resolvePhoneFromLid(
         const allItems = [...contacts, ...chats];
         const lidDigits = parseDigitsFromLid(normalizedLid);
 
+        /*
+         * Yalnız target item deyil, Evolution-un qaytardığı chat/contact
+         * obyektlərində görünən etibarlı LID -> PN cütlərini də yadda saxla.
+         * Xüsusən lastMessage.key.remoteJidAlt burada çox vacibdir.
+         */
+        await learnLidPhoneMappingsFromEvolutionItems(
+            allItems,
+            rejectSet,
+            'findContacts/findChats'
+        );
+
         const matchesLid = (item) => {
             const ids = [
                 item?.remoteJid,
@@ -712,24 +1025,54 @@ async function resolvePhoneFromLid(
                     Array.isArray(groupResult?.data?.participants)
                         ? groupResult.data.participants
                         : normalizeEvolutionResultList(groupResult?.data);
+                /*
+                 * Bu siyahıda yüzlərlə üzv üçün { id: @lid, phoneNumber: @s.whatsapp.net }
+                 * cütü gəlir. Hamısını bir dəfə öyrənirik ki, başqa bir mesajda həmin
+                 * istifadəçinin phoneNumber sahəsi yox olsa belə əvvəlki mapping itməsin.
+                 */
+                await learnLidPhoneMappingsFromEvolutionItems(
+                    groupParticipants,
+                    rejectSet,
+                    'group/participants'
+                );
+
                 groupMatchingItems = groupParticipants.filter(matchesLid);
 
-                for (const item of groupMatchingItems) {
-                    resolvedPhone =
-                        extractPhoneFromSpecificEvolutionItem(
-                            item,
-                            rejectSet,
-                            lidDigits
-                        );
+                // Bəlkə target mapping başqa əvvəlki qrup sorğusundan artıq öyrənilib.
+                resolvedPhone =
+                    resolvedPhone ||
+                    await getPersistentPhoneForLid(
+                        normalizedLid,
+                        rejectSet
+                    );
 
-                    if (resolvedPhone) {
-                        break;
+                if (!resolvedPhone) {
+                    for (const item of groupMatchingItems) {
+                        const candidatePhone =
+                            extractPhoneFromSpecificEvolutionItem(
+                                item,
+                                rejectSet,
+                                lidDigits
+                            );
+
+                        if (candidatePhone) {
+                            resolvedPhone = candidatePhone;
+                            break;
+                        }
                     }
                 }
             } catch (error) {
                 groupParticipantsStatus = 'rejected';
                 groupParticipantsError = toErrorDiagnostic(error);
             }
+        }
+
+        if (resolvedPhone) {
+            await rememberLidPhonePairs(
+                [{ lidJid: normalizedLid, phone: resolvedPhone }],
+                rejectSet,
+                'resolved_target'
+            );
         }
 
         const requestFailed =
@@ -1645,6 +1988,32 @@ app.post(['/webhook', '/webhook/*'], async (req, res) => {
                 instanceSelfPhone,
                 webhookOwnerPhone
             );
+
+        /*
+         * Eyni webhook-da həm LID, həm də PN (participantAlt/senderPn) gəlirsə
+         * bunu gələcək mesajlar üçün dərhal persistent map-ə yazırıq.
+         */
+        const directLids = senderJidCandidates.filter(
+            value => /^\d+@lid$/.test(value)
+        );
+        const directPhones = senderJidCandidates
+            .map(parsePhoneFromSNetJid)
+            .filter(
+                value =>
+                    value &&
+                    !rejectedInstancePhones.has(value)
+            );
+
+        if (directLids.length === 1 && directPhones.length === 1) {
+            await rememberLidPhonePairs(
+                [{
+                    lidJid: directLids[0],
+                    phone: directPhones[0],
+                }],
+                rejectedInstancePhones,
+                'messages_upsert_direct_fields'
+            );
+        }
 
         let phone = null;
         const lidDiagnostic = {};
