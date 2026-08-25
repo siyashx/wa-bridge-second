@@ -28,6 +28,8 @@ const {
     LID_PHONE_HISTORY_FALLBACK = '1',
     LID_PHONE_HISTORY_PAGE_SIZE = '100',
     LID_PHONE_HISTORY_MAX_PAGES = '5',
+    LID_PHONE_GROUP_HISTORY_PAGE_SIZE = '200',
+    LID_PHONE_GROUP_HISTORY_MAX_PAGES = '15',
     LID_PHONE_CROSS_INSTANCE = '1',
 } = process.env;
 
@@ -892,11 +894,16 @@ async function findPhoneInMessageHistory(
     lidJid,
     rejectedPhones,
     requestConfig,
-    urlBase
+    urlBase,
+    groupJid = null
 ) {
+    const normalizedGroupJid = String(groupJid || '').trim();
     const historyDiagnostic = {
         attempted: false,
         instanceName,
+        groupJid: /@g\.us$/.test(normalizedGroupJid)
+            ? normalizedGroupJid
+            : null,
         modesAttempted: [],
         pagesRequested: 0,
         recordsScanned: 0,
@@ -912,12 +919,33 @@ async function findPhoneInMessageHistory(
 
     historyDiagnostic.attempted = true;
 
-    const pageSize = Math.min(200, Math.max(10, Number(LID_PHONE_HISTORY_PAGE_SIZE) || 100));
-    const maxPages = Math.min(20, Math.max(1, Number(LID_PHONE_HISTORY_MAX_PAGES) || 5));
+    const pageSize = Math.min(
+        200,
+        Math.max(10, Number(LID_PHONE_HISTORY_PAGE_SIZE) || 100)
+    );
+    const maxPages = Math.min(
+        20,
+        Math.max(1, Number(LID_PHONE_HISTORY_MAX_PAGES) || 5)
+    );
+    const groupPageSize = Math.min(
+        200,
+        Math.max(25, Number(LID_PHONE_GROUP_HISTORY_PAGE_SIZE) || 200)
+    );
+    const groupMaxPages = Math.min(
+        30,
+        Math.max(1, Number(LID_PHONE_GROUP_HISTORY_MAX_PAGES) || 15)
+    );
     const lidDigits = parseDigitsFromLid(lidJid);
     const matchingSamples = [];
 
-    const scanMode = async (modeName, bodyForPage) => {
+    const scanMode = async (
+        modeName,
+        bodyForPage,
+        {
+            scanPageSize = pageSize,
+            scanMaxPages = maxPages,
+        } = {}
+    ) => {
         const modeDiagnostic = {
             mode: modeName,
             pagesRequested: 0,
@@ -927,11 +955,11 @@ async function findPhoneInMessageHistory(
         };
         historyDiagnostic.modesAttempted.push(modeDiagnostic);
 
-        for (let page = 1; page <= maxPages; page += 1) {
+        for (let page = 1; page <= scanMaxPages; page += 1) {
             try {
                 const response = await axios.post(
                     `${urlBase}/chat/findMessages/${encodeURIComponent(instanceName)}`,
-                    bodyForPage(page, pageSize),
+                    bodyForPage(page, scanPageSize),
                     requestConfig
                 );
 
@@ -943,9 +971,9 @@ async function findPhoneInMessageHistory(
                 historyDiagnostic.recordsScanned += records.length;
 
                 /*
-                 * Evolution-un bəzi 2.3.x build-lərində remoteJid filter-in
-                 * etibarsız olduğu barədə reportlar var. Cavabı hər halda
-                 * lokal olaraq target LID ilə filter edirik.
+                 * Server-side filter düzgün işləsə də, target göndərəni həmişə
+                 * lokal olaraq LID ilə yoxlayırıq. Qrup mesajlarında remoteJid
+                 * qrupun JID-i, real göndərən isə key.participant olur.
                  */
                 const matchingRecords = records.filter(item =>
                     evolutionItemMatchesLid(item, lidJid)
@@ -993,7 +1021,7 @@ async function findPhoneInMessageHistory(
 
                 if (records.length === 0) break;
                 if (totalPages > 0 && currentPage >= totalPages) break;
-                if (records.length < pageSize && totalPages === 0) break;
+                if (records.length < scanPageSize && totalPages === 0) break;
             } catch (error) {
                 modeDiagnostic.requestError = {
                     status: error?.response?.status || null,
@@ -1008,31 +1036,58 @@ async function findPhoneInMessageHistory(
         return null;
     };
 
-    /* Normal və ən ucuz yol: Evolution DB-də yalnız bu LID-i soruş. */
-    let resolvedPhone = await scanMode(
-        'filtered_lid',
-        (page, offset) => ({
-            where: {
-                key: {
-                    remoteJid: lidJid,
-                },
-            },
-            page,
-            offset,
-        })
-    );
+    let resolvedPhone = null;
 
     /*
-     * Bəzi 2.3.x qurulumlarında findMessages remoteJid filter-i boş cavab verir.
-     * Filtered sorğu heç record qaytarmadısa (və ya request error oldusa),
-     * yalnız onda limitli filtrsiz tarixçə çəkib target LID-i lokal seçirik.
+     * Qrup mesajlarında düzgün server-side açar göndərənin LID-i deyil,
+     * key.remoteJid = groupJid olur. Ona görə əvvəl konkret qrupun daha dərin
+     * tarixçəsini çəkirik və key.participant === target LID olan mesajları
+     * lokal seçirik. Default: 15 x 200 = maksimum 3000 qrup mesajı.
      */
-    const filteredMode = historyDiagnostic.modesAttempted[0];
+    if (/@g\.us$/.test(normalizedGroupJid)) {
+        resolvedPhone = await scanMode(
+            'filtered_group_local_participant_match',
+            (page, offset) => ({
+                where: {
+                    key: {
+                        remoteJid: normalizedGroupJid,
+                    },
+                },
+                page,
+                offset,
+            }),
+            {
+                scanPageSize: groupPageSize,
+                scanMaxPages: groupMaxPages,
+            }
+        );
+    } else {
+        /* Direct/LID chat üçün əvvəlki ucuz filtr qalır. */
+        resolvedPhone = await scanMode(
+            'filtered_lid',
+            (page, offset) => ({
+                where: {
+                    key: {
+                        remoteJid: lidJid,
+                    },
+                },
+                page,
+                offset,
+            })
+        );
+    }
+
+    /*
+     * Evolution 2.3.x-də remoteJid filter-in boş cavab verdiyi hallar var.
+     * Primary filtered mode heç record qaytarmadısa və ya request error oldusa,
+     * son fallback kimi limitli ümumi tarixçə çəkib target LID-i lokal seçirik.
+     */
+    const primaryMode = historyDiagnostic.modesAttempted[0];
     const shouldTryUnfiltered =
         !resolvedPhone &&
         (
-            Number(filteredMode?.recordsScanned || 0) === 0 ||
-            !!filteredMode?.requestError
+            Number(primaryMode?.recordsScanned || 0) === 0 ||
+            !!primaryMode?.requestError
         );
 
     if (shouldTryUnfiltered) {
@@ -1161,7 +1216,8 @@ async function findPhoneInOtherInstances(
                 lidJid,
                 rejectedPhones,
                 requestConfig,
-                urlBase
+                urlBase,
+                null
             );
 
             instanceDiag.history = historyResult.diagnostic;
@@ -1497,7 +1553,8 @@ async function resolvePhoneFromLid(
                 normalizedLid,
                 rejectSet,
                 requestConfig,
-                urlBase
+                urlBase,
+                normalizedGroupJid
             );
             historyDiagnostic = historyResult.diagnostic;
             resolvedPhone = historyResult.phone || resolvedPhone;
