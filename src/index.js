@@ -25,6 +25,10 @@ const {
     MISSING_PHONE_SAVE_RAW = '1',
     LID_PHONE_MAP_ENABLED = '1',
     LID_PHONE_MAP_FILE = './data/lid-phone-map.jsonl',
+    LID_PHONE_HISTORY_FALLBACK = '1',
+    LID_PHONE_HISTORY_PAGE_SIZE = '100',
+    LID_PHONE_HISTORY_MAX_PAGES = '5',
+    LID_PHONE_CROSS_INSTANCE = '1',
 } = process.env;
 
 const MOTO_TAKSI_ORDER_GROUP_JID = String(
@@ -760,6 +764,428 @@ function getLidJidFromEvolutionItem(item) {
     );
 }
 
+function evolutionItemMatchesLid(item, lidJid) {
+    const target = String(lidJid || '').trim();
+    if (!/^\d+@lid$/.test(target) || !item || typeof item !== 'object') {
+        return false;
+    }
+
+    const candidates = [
+        item.remoteJid,
+        item.jid,
+        item.id,
+        item.lid,
+        item.participant,
+        item.participantLid,
+        item.senderLid,
+        item.key?.remoteJid,
+        item.key?.participant,
+        item.key?.senderLid,
+        item.lastMessage?.key?.remoteJid,
+        item.lastMessage?.key?.participant,
+        item.lastMessage?.key?.senderLid,
+    ];
+
+    return candidates
+        .map(value => String(value || '').trim())
+        .filter(Boolean)
+        .includes(target);
+}
+
+function extractPhoneFromHistoryItemForLid(
+    item,
+    lidJid,
+    rejectedPhones = new Set()
+) {
+    const targetLid = String(lidJid || '').trim();
+    if (!/^\d+@lid$/.test(targetLid) || !item || typeof item !== 'object') {
+        return null;
+    }
+
+    const lidDigits = parseDigitsFromLid(targetLid);
+
+    /* Əvvəl explicit PN/Alt sahələrindən istifadə et. */
+    const explicitPhone = extractPhoneFromSpecificEvolutionItem(
+        item,
+        rejectedPhones,
+        lidDigits
+    );
+    if (explicitPhone) return explicitPhone;
+
+    const rejectSet = rejectedPhones instanceof Set
+        ? rejectedPhones
+        : new Set();
+
+    const isAllowedPhone = (phone) => (
+        /^\d{8,15}$/.test(String(phone || '')) &&
+        !rejectSet.has(String(phone)) &&
+        !ALL_INSTANCE_SELF_PHONES.has(String(phone)) &&
+        String(phone) !== String(lidDigits || '')
+    );
+
+    /*
+     * Tarixçədə bəzən remoteJidAlt yoxdur, amma incoming direct message-də
+     * key.senderLid target LID, key.remoteJid isə PN JID olur. Bu kombinasiyada
+     * remoteJid həmin sender-in telefonudur. fromMe=false şərti outgoing mesajda
+     * öz LID-imizi qarşı tərəfin telefonuna səhv bağlamağın qarşısını alır.
+     */
+    const keys = [
+        item.key,
+        item.lastMessage?.key,
+    ].filter(Boolean);
+
+    for (const key of keys) {
+        const senderLid = String(key?.senderLid || '').trim();
+        const participantLid = String(key?.participant || '').trim();
+
+        const candidates = [];
+
+        if (senderLid === targetLid && key?.fromMe === false) {
+            candidates.push(key?.participant, key?.remoteJid);
+        }
+
+        if (participantLid === targetLid) {
+            candidates.push(key?.participantAlt);
+        }
+
+        for (const value of candidates) {
+            const phone = parsePhoneFromSNetJid(value);
+            if (phone && isAllowedPhone(phone)) {
+                return phone;
+            }
+        }
+    }
+
+    return null;
+}
+
+function normalizeEvolutionMessageList(payload) {
+    if (Array.isArray(payload)) return payload;
+
+    const candidates = [
+        payload?.messages?.records,
+        payload?.data?.messages?.records,
+        payload?.response?.messages?.records,
+        payload?.data?.records,
+        payload?.messages,
+        payload?.records,
+        payload?.data,
+        payload?.result,
+    ];
+
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) return candidate;
+    }
+
+    return [];
+}
+
+function getConfiguredEvolutionInstanceNames() {
+    return [
+        String(process.env.EVOLUTION_INSTANCE_1 || '').trim(),
+        String(process.env.EVOLUTION_INSTANCE_2 || '').trim(),
+    ].filter(Boolean);
+}
+
+async function findPhoneInMessageHistory(
+    instanceName,
+    lidJid,
+    rejectedPhones,
+    requestConfig,
+    urlBase
+) {
+    const historyDiagnostic = {
+        attempted: false,
+        instanceName,
+        modesAttempted: [],
+        pagesRequested: 0,
+        recordsScanned: 0,
+        matchingRecordsCount: 0,
+        resolvedPhone: null,
+        requestError: null,
+    };
+
+    if (String(LID_PHONE_HISTORY_FALLBACK) !== '1') {
+        historyDiagnostic.disabled = true;
+        return { phone: null, diagnostic: historyDiagnostic };
+    }
+
+    historyDiagnostic.attempted = true;
+
+    const pageSize = Math.min(200, Math.max(10, Number(LID_PHONE_HISTORY_PAGE_SIZE) || 100));
+    const maxPages = Math.min(20, Math.max(1, Number(LID_PHONE_HISTORY_MAX_PAGES) || 5));
+    const lidDigits = parseDigitsFromLid(lidJid);
+    const matchingSamples = [];
+
+    const scanMode = async (modeName, bodyForPage) => {
+        const modeDiagnostic = {
+            mode: modeName,
+            pagesRequested: 0,
+            recordsScanned: 0,
+            matchingRecordsCount: 0,
+            requestError: null,
+        };
+        historyDiagnostic.modesAttempted.push(modeDiagnostic);
+
+        for (let page = 1; page <= maxPages; page += 1) {
+            try {
+                const response = await axios.post(
+                    `${urlBase}/chat/findMessages/${encodeURIComponent(instanceName)}`,
+                    bodyForPage(page, pageSize),
+                    requestConfig
+                );
+
+                modeDiagnostic.pagesRequested += 1;
+                historyDiagnostic.pagesRequested += 1;
+
+                const records = normalizeEvolutionMessageList(response?.data);
+                modeDiagnostic.recordsScanned += records.length;
+                historyDiagnostic.recordsScanned += records.length;
+
+                /*
+                 * Evolution-un bəzi 2.3.x build-lərində remoteJid filter-in
+                 * etibarsız olduğu barədə reportlar var. Cavabı hər halda
+                 * lokal olaraq target LID ilə filter edirik.
+                 */
+                const matchingRecords = records.filter(item =>
+                    evolutionItemMatchesLid(item, lidJid)
+                );
+
+                modeDiagnostic.matchingRecordsCount += matchingRecords.length;
+                historyDiagnostic.matchingRecordsCount += matchingRecords.length;
+                matchingSamples.push(...matchingRecords.slice(0, 5));
+
+                let resolvedPhone = await getPersistentPhoneForLid(
+                    lidJid,
+                    rejectedPhones
+                );
+
+                if (!resolvedPhone) {
+                    for (const item of matchingRecords) {
+                        resolvedPhone = extractPhoneFromHistoryItemForLid(
+                            item,
+                            lidJid,
+                            rejectedPhones
+                        );
+                        if (resolvedPhone) break;
+                    }
+                }
+
+                if (resolvedPhone) {
+                    await rememberLidPhonePairs(
+                        [{ lidJid, phone: resolvedPhone }],
+                        rejectedPhones,
+                        `findMessages:${instanceName}:${modeName}`
+                    );
+                    historyDiagnostic.resolvedPhone = resolvedPhone;
+                    historyDiagnostic.matchingSamples = matchingSamples.slice(0, 10);
+                    return resolvedPhone;
+                }
+
+                const meta =
+                    response?.data?.messages ||
+                    response?.data?.data?.messages ||
+                    response?.data?.response?.messages ||
+                    null;
+
+                const totalPages = Number(meta?.pages || 0);
+                const currentPage = Number(meta?.currentPage || page);
+
+                if (records.length === 0) break;
+                if (totalPages > 0 && currentPage >= totalPages) break;
+                if (records.length < pageSize && totalPages === 0) break;
+            } catch (error) {
+                modeDiagnostic.requestError = {
+                    status: error?.response?.status || null,
+                    data: error?.response?.data || null,
+                    message: error?.message || String(error),
+                };
+                historyDiagnostic.requestError = modeDiagnostic.requestError;
+                break;
+            }
+        }
+
+        return null;
+    };
+
+    /* Normal və ən ucuz yol: Evolution DB-də yalnız bu LID-i soruş. */
+    let resolvedPhone = await scanMode(
+        'filtered_lid',
+        (page, offset) => ({
+            where: {
+                key: {
+                    remoteJid: lidJid,
+                },
+            },
+            page,
+            offset,
+        })
+    );
+
+    /*
+     * Bəzi 2.3.x qurulumlarında findMessages remoteJid filter-i boş cavab verir.
+     * Filtered sorğu heç record qaytarmadısa (və ya request error oldusa),
+     * yalnız onda limitli filtrsiz tarixçə çəkib target LID-i lokal seçirik.
+     */
+    const filteredMode = historyDiagnostic.modesAttempted[0];
+    const shouldTryUnfiltered =
+        !resolvedPhone &&
+        (
+            Number(filteredMode?.recordsScanned || 0) === 0 ||
+            !!filteredMode?.requestError
+        );
+
+    if (shouldTryUnfiltered) {
+        resolvedPhone = await scanMode(
+            'unfiltered_local_match',
+            (page, offset) => ({ page, offset })
+        );
+    }
+
+    historyDiagnostic.matchingSamples = matchingSamples.slice(0, 10);
+    return { phone: resolvedPhone || null, diagnostic: historyDiagnostic };
+}
+
+async function findPhoneInOtherInstances(
+    primaryInstanceName,
+    lidJid,
+    rejectedPhones,
+    requestConfig,
+    urlBase
+) {
+    const crossDiagnostic = {
+        attempted: false,
+        instances: [],
+        resolvedPhone: null,
+        resolvedByInstance: null,
+    };
+
+    if (String(LID_PHONE_CROSS_INSTANCE) !== '1') {
+        crossDiagnostic.disabled = true;
+        return { phone: null, diagnostic: crossDiagnostic };
+    }
+
+    const otherInstances = [...new Set(getConfiguredEvolutionInstanceNames())]
+        .filter(name => name && name !== primaryInstanceName);
+
+    if (otherInstances.length === 0) {
+        return { phone: null, diagnostic: crossDiagnostic };
+    }
+
+    crossDiagnostic.attempted = true;
+    const query = { where: { remoteJid: lidJid } };
+    const lidDigits = parseDigitsFromLid(lidJid);
+
+    for (const otherInstance of otherInstances) {
+        const instanceDiag = {
+            instanceName: otherInstance,
+            contactsStatus: 'not_attempted',
+            chatsStatus: 'not_attempted',
+            contactsCount: 0,
+            chatsCount: 0,
+            matchingItemsCount: 0,
+            history: null,
+            resolvedPhone: null,
+        };
+
+        try {
+            const [contactsResult, chatsResult] = await Promise.allSettled([
+                axios.post(
+                    `${urlBase}/chat/findContacts/${encodeURIComponent(otherInstance)}`,
+                    query,
+                    requestConfig
+                ),
+                axios.post(
+                    `${urlBase}/chat/findChats/${encodeURIComponent(otherInstance)}`,
+                    query,
+                    requestConfig
+                ),
+            ]);
+
+            instanceDiag.contactsStatus = contactsResult.status;
+            instanceDiag.chatsStatus = chatsResult.status;
+
+            const contacts = contactsResult.status === 'fulfilled'
+                ? normalizeEvolutionResultList(contactsResult.value?.data)
+                : [];
+            const chats = chatsResult.status === 'fulfilled'
+                ? normalizeEvolutionResultList(chatsResult.value?.data)
+                : [];
+
+            instanceDiag.contactsCount = contacts.length;
+            instanceDiag.chatsCount = chats.length;
+
+            const allItems = [...contacts, ...chats];
+            const matchingItems = allItems.filter(item =>
+                evolutionItemMatchesLid(item, lidJid)
+            );
+            instanceDiag.matchingItemsCount = matchingItems.length;
+
+            await learnLidPhoneMappingsFromEvolutionItems(
+                matchingItems,
+                rejectedPhones,
+                `cross_instance_contacts_chats:${otherInstance}`
+            );
+
+            let resolvedPhone = await getPersistentPhoneForLid(
+                lidJid,
+                rejectedPhones
+            );
+
+            if (!resolvedPhone) {
+                for (const item of matchingItems) {
+                    resolvedPhone = extractPhoneFromSpecificEvolutionItem(
+                        item,
+                        rejectedPhones,
+                        lidDigits
+                    );
+                    if (resolvedPhone) break;
+                }
+            }
+
+            if (resolvedPhone) {
+                await rememberLidPhonePairs(
+                    [{ lidJid, phone: resolvedPhone }],
+                    rejectedPhones,
+                    `cross_instance_contacts_chats:${otherInstance}`
+                );
+                instanceDiag.resolvedPhone = resolvedPhone;
+                crossDiagnostic.instances.push(instanceDiag);
+                crossDiagnostic.resolvedPhone = resolvedPhone;
+                crossDiagnostic.resolvedByInstance = otherInstance;
+                return { phone: resolvedPhone, diagnostic: crossDiagnostic };
+            }
+
+            const historyResult = await findPhoneInMessageHistory(
+                otherInstance,
+                lidJid,
+                rejectedPhones,
+                requestConfig,
+                urlBase
+            );
+
+            instanceDiag.history = historyResult.diagnostic;
+            instanceDiag.resolvedPhone = historyResult.phone;
+            crossDiagnostic.instances.push(instanceDiag);
+
+            if (historyResult.phone) {
+                crossDiagnostic.resolvedPhone = historyResult.phone;
+                crossDiagnostic.resolvedByInstance = otherInstance;
+                return { phone: historyResult.phone, diagnostic: crossDiagnostic };
+            }
+        } catch (error) {
+            instanceDiag.error = {
+                status: error?.response?.status || null,
+                data: error?.response?.data || null,
+                message: error?.message || String(error),
+            };
+            crossDiagnostic.instances.push(instanceDiag);
+        }
+    }
+
+    return { phone: null, diagnostic: crossDiagnostic };
+}
+
 async function learnLidPhoneMappingsFromEvolutionItems(
     items,
     rejectedPhones = new Set(),
@@ -952,21 +1378,8 @@ async function resolvePhoneFromLid(
             'findContacts/findChats'
         );
 
-        const matchesLid = (item) => {
-            const ids = [
-                item?.remoteJid,
-                item?.jid,
-                item?.id,
-                item?.lid,
-                item?.participant,
-                item?.participantLid,
-                item?.senderLid,
-            ]
-                .map(value => String(value || '').trim())
-                .filter(Boolean);
-
-            return ids.includes(normalizedLid);
-        };
+        const matchesLid = (item) =>
+            evolutionItemMatchesLid(item, normalizedLid);
 
         const matchingItems = allItems.filter(matchesLid);
 
@@ -1067,6 +1480,41 @@ async function resolvePhoneFromLid(
             }
         }
 
+        /*
+         * Son fallback-lar:
+         * 1) eyni instance-da message history
+         * 2) digər configured Evolution instance-da contacts/chats + history
+         *
+         * Bunlar yalnız contacts/chats/group participant mapping-i boş qaldıqda
+         * işləyir, ona görə normal mesaj axınına əlavə API yükü yaratmır.
+         */
+        let historyDiagnostic = null;
+        let crossInstanceDiagnostic = null;
+
+        if (!resolvedPhone) {
+            const historyResult = await findPhoneInMessageHistory(
+                instanceName,
+                normalizedLid,
+                rejectSet,
+                requestConfig,
+                urlBase
+            );
+            historyDiagnostic = historyResult.diagnostic;
+            resolvedPhone = historyResult.phone || resolvedPhone;
+        }
+
+        if (!resolvedPhone) {
+            const crossResult = await findPhoneInOtherInstances(
+                instanceName,
+                normalizedLid,
+                rejectSet,
+                requestConfig,
+                urlBase
+            );
+            crossInstanceDiagnostic = crossResult.diagnostic;
+            resolvedPhone = crossResult.phone || resolvedPhone;
+        }
+
         if (resolvedPhone) {
             await rememberLidPhonePairs(
                 [{ lidJid: normalizedLid, phone: resolvedPhone }],
@@ -1083,7 +1531,13 @@ async function resolvePhoneFromLid(
         let failureReason = null;
 
         if (!resolvedPhone) {
-            if (groupMatchingItems.length > 0) {
+            if (
+                historyDiagnostic?.attempted ||
+                crossInstanceDiagnostic?.attempted
+            ) {
+                failureReason =
+                    'lid_history_and_cross_instance_exhausted_without_phone';
+            } else if (groupMatchingItems.length > 0) {
                 failureReason =
                     'lid_group_participant_match_without_phone_fields';
             } else if (matchingItems.length > 0) {
@@ -1131,6 +1585,8 @@ async function resolvePhoneFromLid(
             groupMatchingItemsCount: groupMatchingItems.length,
             groupMatchingItems,
             groupParticipantsSample: groupParticipants.slice(0, 50),
+            historyDiagnostic,
+            crossInstanceDiagnostic,
             resolvedPhone,
             failureReason,
         };
